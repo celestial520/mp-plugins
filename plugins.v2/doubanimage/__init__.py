@@ -4,6 +4,7 @@ import hmac
 import re
 import time
 from collections import deque
+from io import BytesIO
 from typing import Any, Deque, Dict, List, Optional, Tuple
 from urllib.parse import quote, urlparse
 
@@ -40,12 +41,20 @@ class DoubanImage(_PluginBase):
           本版在发送前探测图片真实宽高，若判定为竖图，则回豆瓣的剧照接口
           （/movie|tv/{id}/photos）按宽高挑一张真正的横版剧照替换，
           从根上换成"专门的横屏海报"，而不是硬裁竖图。
+
+    v1.3：改成"自己裁"而不是"另找一张图" ——
+          实测 MP 网页订阅卡片里那张"横版背景"并不是独立的一张横图：
+          订阅记录里的 backdrop 就是 1080x1619 的竖图，网页用 CSS 裁上部显示，
+          而企业微信裁的是正中，于是只剩躯干。
+          本版改为在代理端用 Pillow 把竖图**按上部**裁成 16:9（复现网页观感），
+          不再默认依赖豆瓣剧照（其剧照区常混入别的剧的图，容易串图）。
+          想改用官方横版剧照时，打开「优先使用豆瓣横版剧照」开关即可。
     """
 
     plugin_name = "豆瓣通知图片代理"
-    plugin_desc = "把通知里的豆瓣海报换成本机代理地址，并自动改用横版剧照，解决微信/企业微信通知图片不显示或被裁切"
+    plugin_desc = "把通知里的豆瓣海报换成本机代理地址，并把竖图按上部裁成横版封面，解决微信/企业微信通知图片不显示或被裁得只剩中间一条"
     plugin_icon = ""
-    plugin_version = "1.2"
+    plugin_version = "1.3"
     plugin_author = "celestial520"
     author_url = "https://github.com/celestial520"
     plugin_config_prefix = "doubanimage_"
@@ -53,9 +62,13 @@ class DoubanImage(_PluginBase):
     auth_level = 1
 
     _enabled: bool = False
-    # 是否把竖版海报换成横版剧照
+    # 是否处理竖版封面
     _landscape: bool = True
-    # 简单内存缓存：url -> (content, media_type)
+    # True=优先用豆瓣横版剧照；False=自己把竖图按上部裁成 16:9
+    _official_first: bool = False
+    # 裁剪时保留的顶部起点（0.06 = 从 6% 处开始裁，避开顶部黑边/台标）
+    _crop_top: float = 0.06
+    # 简单内存缓存：key -> (content, media_type)
     _cache: Dict[str, Tuple[bytes, str]] = {}
     _cache_limit: int = 300
     # 图片尺寸缓存：url -> (width, height)
@@ -74,7 +87,7 @@ class DoubanImage(_PluginBase):
         "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     )
     # 版本参数：企业微信会按 picurl 缓存抓图结果，带上版本号可绕过旧的失败缓存
-    _cache_buster = "v12"
+    _cache_buster = "v13"
 
     # 豆瓣 App 接口（与 MP 内部 DoubanApi 一致，用于查剧照）
     _api_base = "https://frodo.douban.com/api/v2"
@@ -97,6 +110,7 @@ class DoubanImage(_PluginBase):
         if config:
             self._enabled = bool(config.get("enabled"))
             self._landscape = bool(config.get("landscape", True))
+            self._official_first = bool(config.get("official_first", False))
 
     def stop_service(self):
         self._cache = {}
@@ -160,7 +174,20 @@ class DoubanImage(_PluginBase):
                                         "component": "VSwitch",
                                         "props": {
                                             "model": "landscape",
-                                            "label": "竖版海报自动换横版剧照",
+                                            "label": "竖版封面自动转横版",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "official_first",
+                                            "label": "优先使用豆瓣横版剧照",
                                         },
                                     }
                                 ],
@@ -184,8 +211,9 @@ class DoubanImage(_PluginBase):
                                                 "你的 APP_DOMAIN + /api/v1/plugin/DoubanImage/img?url=...。"
                                                 "该代理需要能从公网访问（企业微信服务器要抓图），"
                                                 "并且同时支持 GET / HEAD 两种请求。"
-                                                "「竖版海报自动换横版剧照」开启时，"
-                                                "若封面是 2:3 竖图，会改取该条目豆瓣剧照里的横版图。"
+                                                "「竖版封面自动转横版」开启时，封面若是 2:3 竖图，"
+                                                "会按上部裁成 16:9（与 MP 网页卡片的观感一致）；"
+                                                "若再打开「优先使用豆瓣横版剧照」，则改用该条目的横版剧照。"
                                             ),
                                         },
                                     }
@@ -195,7 +223,7 @@ class DoubanImage(_PluginBase):
                     },
                 ],
             }
-        ], {"enabled": False, "landscape": True}
+        ], {"enabled": False, "landscape": True, "official_first": False}
 
     def get_page(self) -> List[dict]:
         return []
@@ -222,62 +250,71 @@ class DoubanImage(_PluginBase):
             self._record_rewrite(None, None, "该通知没有图片，跳过")
             return
 
-        # 关键：竖版海报 -> 横版剧照
-        final_image = image
+        # 关键：竖版封面 -> 横版（裁剪或换剧照）
+        final_image, extra = image, {}
         try:
-            final_image = self.ensure_landscape(image, mediainfo)
+            final_image, extra = self.ensure_landscape(image, mediainfo)
         except Exception as err:
-            logger.warn(f"横版剧照替换失败，继续使用原图：{err}")
-            final_image = image
+            logger.warn(f"横版封面处理失败，继续使用原图：{err}")
+            final_image, extra = image, {}
 
-        proxy_url = self.build_proxy_url(final_image)
+        proxy_url = self.build_proxy_url(final_image, extra)
         if not proxy_url:
             self._record_rewrite(final_image, None, "非豆瓣图片，保持原样")
             return
         try:
             message.image = proxy_url
-            suffix = "" if final_image == image else "（已换横版剧照）"
+            if final_image != image:
+                suffix = "（已换横版剧照）"
+            elif extra:
+                suffix = "（代理端裁成横版）"
+            else:
+                suffix = ""
             self._record_rewrite(image, proxy_url, f"已改写为代理地址{suffix}")
             logger.info(f"豆瓣通知图片已改写为代理地址：{proxy_url}")
         except Exception as err:
             self._record_rewrite(image, None, f"改写失败：{err}")
             logger.warn(f"改写通知图片失败：{err}")
 
-    # ------------------------------------------------------------------ 横版替换
+    # ------------------------------------------------------------------ 横版处理
 
-    def ensure_landscape(self, image: str, mediainfo) -> str:
+    def ensure_landscape(self, image: str, mediainfo) -> Tuple[str, Dict[str, Any]]:
         """
-        封面若是竖图，改用该条目真正的横版剧照。
+        封面若是竖图，返回「横版地址 + 额外参数」：
+          - 默认：地址不变，交给代理端按上部裁成 16:9
+          - 打开「优先使用豆瓣横版剧照」：先尝试换成本条目的横版剧照
         """
         if not self._landscape or mediainfo is None:
-            return image
+            return image, {}
         if not self.is_douban_image(image):
-            return image
+            return image, {}
 
         size = self._probe_size(image)
         if not size:
             self._record_landscape(image, None, "无法探测尺寸，保持原图")
-            return image
+            return image, {}
         width, height = size
         ratio = width / float(height or 1)
         if ratio >= self._landscape_ratio:
-            self._record_landscape(image, None, f"{width}x{height} 已是横图，无需替换")
-            return image
+            self._record_landscape(image, None, f"{width}x{height} 已是横图，无需处理")
+            return image, {}
 
         douban_id = str(getattr(mediainfo, "douban_id", "") or "").strip()
-        if not douban_id:
-            self._record_landscape(image, None, f"{width}x{height} 竖图，但没有 douban_id")
-            return image
-
-        is_movie = self._is_movie(mediainfo)
-        landscape = self._find_landscape(douban_id, is_movie)
-        if not landscape:
+        if self._official_first and douban_id:
+            landscape = self._find_landscape(douban_id, self._is_movie(mediainfo))
+            if landscape:
+                self._record_landscape(
+                    image, landscape, f"{width}x{height} 竖图 -> 豆瓣横版剧照"
+                )
+                return landscape, {}
             self._record_landscape(
-                image, None, f"{width}x{height} 竖图，豆瓣剧照里没找到横图"
+                image, None, f"{width}x{height} 竖图，豆瓣没有可用横图，改裁上部"
             )
-            return image
-        self._record_landscape(image, landscape, f"{width}x{height} 竖图 -> 横版剧照")
-        return landscape
+
+        self._record_landscape(
+            image, None, f"{width}x{height} 竖图 -> 代理端按上部裁成 16:9"
+        )
+        return image, {"fit": "16x9", "top": self._crop_top}
 
     @staticmethod
     def _is_movie(mediainfo) -> bool:
@@ -613,7 +650,9 @@ class DoubanImage(_PluginBase):
             pass
         return "doubanimage"
 
-    def build_proxy_url(self, url: str) -> Optional[str]:
+    def build_proxy_url(
+        self, url: str, extra: Optional[Dict[str, Any]] = None
+    ) -> Optional[str]:
         if not self.is_douban_image(url):
             return None
         domain = str(getattr(settings, "APP_DOMAIN", "") or "").strip().rstrip("/")
@@ -621,10 +660,12 @@ class DoubanImage(_PluginBase):
             logger.warn("未配置 APP_DOMAIN（对外访问地址），无法生成图片代理地址")
             self._record_rewrite(url, None, "未配置 APP_DOMAIN")
             return None
-        return (
-            f"{domain}/api/v1/plugin/{self.plugin_id()}/img"
-            f"?url={quote(url, safe='')}&{self._cache_buster}=1"
-        )
+        parts = [f"url={quote(url, safe='')}", f"{self._cache_buster}=1"]
+        for key, value in (extra or {}).items():
+            if value is None or value == "":
+                continue
+            parts.append(f"{key}={quote(str(value), safe='')}")
+        return f"{domain}/api/v1/plugin/{self.plugin_id()}/img?" + "&".join(parts)
 
     # ------------------------------------------------------------------ 图片代理
 
@@ -642,16 +683,41 @@ class DoubanImage(_PluginBase):
             pass
         return url
 
-    def _fetch(self, url: str) -> Tuple[Optional[bytes], str, str]:
+    @classmethod
+    def _candidates(cls, url: str) -> List[str]:
+        """
+        豆瓣图有多个镜像子域（img1/img2/img3/img9）。
+        某个子域被风控返回 HTML 时，换一个子域往往就能取到，顺带降低 502 概率。
+        """
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower()
+        urls = [url]
+        if re.match(r"^img\d+\.doubanio\.com$", host):
+            for name in ("img1", "img2", "img3", "img9"):
+                mirror = f"{name}.doubanio.com"
+                if mirror != host:
+                    urls.append(
+                        parsed._replace(
+                            netloc=parsed.netloc.replace(host, mirror)
+                        ).geturl()
+                    )
+        ordered: List[str] = []
+        for item in urls[:3]:
+            ordered.append(cls.prefer_jpeg_url(item))
+            ordered.append(item)
+        return ordered
+
+    def _fetch(self, url: str, cache_key: Optional[str] = None) -> Tuple[Optional[bytes], str, str]:
         """
         取图：优先 .jpg 版本，失败再退回原始地址。返回 (内容, MIME, 说明)
         """
-        cached = self._cache.get(url)
+        key = cache_key or url
+        cached = self._cache.get(key)
         if cached:
             return cached[0], cached[1], "cache"
 
         detail = ""
-        for candidate in dict.fromkeys([self.prefer_jpeg_url(url), url]):
+        for candidate in dict.fromkeys(self._candidates(url)):
             try:
                 resp = requests.get(
                     candidate,
@@ -690,25 +756,80 @@ class DoubanImage(_PluginBase):
 
             if len(self._cache) >= self._cache_limit:
                 self._cache.clear()
-            self._cache[url] = (content, media_type)
+            self._cache[key] = (content, media_type)
             return content, media_type, detail or "ok"
 
         return None, "image/jpeg", detail or "取图失败"
 
-    def img(self, request: Request, url: str = Query(..., description="豆瓣图片地址")):
+    def _crop_landscape(
+        self, content: bytes, top_pct: float, target_ratio: float = 16 / 9
+    ) -> Optional[bytes]:
+        """
+        把竖图按「靠上」的位置裁成 target_ratio 的横图（16:9）。
+        企业微信是从正中裁的，正中对竖版海报来说往往只剩躯干；
+        网页端卡片也是裁上部，所以这里对齐网页的观感。
+        """
+        try:
+            from PIL import Image
+        except Exception:
+            logger.warn("当前环境缺少 Pillow，无法裁剪封面")
+            return None
+        try:
+            with Image.open(BytesIO(content)) as source:
+                image = source.convert("RGB")
+                width, height = image.size
+                if width <= 0 or height <= 0:
+                    return None
+                if width / float(height) >= 1.3:
+                    return None
+                crop_height = min(int(width / target_ratio), height)
+                top = int(height * max(0.0, min(float(top_pct), 0.45)))
+                if top + crop_height > height:
+                    top = max(0, height - crop_height)
+                cropped = image.crop((0, top, width, top + crop_height))
+                if cropped.width > 1280:
+                    cropped = cropped.resize(
+                        (1280, int(round(1280 / target_ratio))), Image.LANCZOS
+                    )
+                buffer = BytesIO()
+                cropped.save(buffer, format="JPEG", quality=88, optimize=True)
+                return buffer.getvalue()
+        except Exception as err:
+            logger.warn(f"裁剪封面失败：{err}")
+            return None
+
+    def img(
+        self,
+        request: Request,
+        url: str = Query(..., description="豆瓣图片地址"),
+        fit: Optional[str] = Query(None, description="横版裁剪：16x9"),
+        top: float = Query(0.06, description="裁剪起点（0~0.45）"),
+    ):
         """
         匿名图片代理：补 Referer 取图后返回。
         HEAD 只回响应头（企业微信抓封面时用 HEAD 探测），GET 回完整图片。
+        fit=16x9 时按上部裁成横版后再返回。
         """
         if not self._enabled:
             return Response(status_code=404)
         if not url or not self.is_douban_image(url):
             return Response(status_code=400)
 
-        content, media_type, detail = self._fetch(url)
+        cache_key = url
+        if fit:
+            cache_key = f"{url}|{fit}|{round(float(top or 0), 3)}"
+
+        content, media_type, detail = self._fetch(url, cache_key)
         if not content:
             self._record_hit(request, 502, 0, detail)
             return Response(status_code=502)
+
+        if fit and fit.lower() == "16x9":
+            cropped = self._crop_landscape(content, float(top or 0))
+            if cropped:
+                content = cropped
+                media_type = "image/jpeg"
+                detail = f"{detail}+crop16x9"
 
         headers = {
             "Cache-Control": "public, max-age=86400",
@@ -723,12 +844,15 @@ class DoubanImage(_PluginBase):
 
     def stat(self):
         """
-        诊断接口：最近的通知地址改写、横版替换与图片抓取记录。
+        诊断接口：最近的通知地址改写、横版处理与图片抓取记录。
         """
         domain = str(getattr(settings, "APP_DOMAIN", "") or "").strip()
         return {
             "enabled": self._enabled,
+            "version": self.plugin_version,
             "landscape": self._landscape,
+            "official_first": self._official_first,
+            "crop_top": self._crop_top,
             "app_domain": domain,
             "plugin_id": self.plugin_id(),
             "cache_size": len(self._cache),

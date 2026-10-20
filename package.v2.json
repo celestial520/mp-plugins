@@ -1,0 +1,13 @@
+{
+  "DoubanImage": {
+    "name": "豆瓣通知图片代理",
+    "description": "自动把通知里的豆瓣海报地址改写为 MoviePilot 自建代理地址，解决企业微信/微信通知图片不显示的问题（豆瓣 CDN 对无 Referer 请求返回 418，且返回 webp 格式不被企业微信封面支持）。",
+    "labels": "消息通知",
+    "version": "1.0",
+    "author": "WorkBuddy",
+    "level": 1,
+    "history": {
+      "v1.0": "首个版本：通知发送前改写豆瓣图片地址，并提供免登录图片代理（自动补 Referer、webp 转 jpeg）"
+    }
+  }
+}

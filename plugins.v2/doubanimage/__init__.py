@@ -42,17 +42,17 @@ class DoubanImage(_PluginBase):
           （/movie|tv/{id}/photos）按宽高挑一张真正的横版剧照替换，
           从根上换成"专门的横屏海报"，而不是硬裁竖图。
 
-    v1.3：改成"自己裁"而不是"另找一张图" ——
+    v1.3：改成"优先官方横图，没有就自己裁" ——
           实测 MP 网页订阅卡片里那张"横版背景"并不是独立的一张横图：
           订阅记录里的 backdrop 就是 1080x1619 的竖图，网页用 CSS 裁上部显示，
           而企业微信裁的是正中，于是只剩躯干。
-          本版改为在代理端用 Pillow 把竖图**按上部**裁成 16:9（复现网页观感），
-          不再默认依赖豆瓣剧照（其剧照区常混入别的剧的图，容易串图）。
-          想改用官方横版剧照时，打开「优先使用豆瓣横版剧照」开关即可。
+          本版两级策略：
+            ① 该条目豆瓣剧照里若有横图（宽高比≥1.35），直接用官方横图；
+            ② 没有横图时，用 Pillow 把竖图**按上部**裁成 16:9（复现网页观感）。
     """
 
     plugin_name = "豆瓣通知图片代理"
-    plugin_desc = "把通知里的豆瓣海报换成本机代理地址，并把竖图按上部裁成横版封面，解决微信/企业微信通知图片不显示或被裁得只剩中间一条"
+    plugin_desc = "把通知里的豆瓣海报换成本机代理地址；竖版封面优先换成官方横版剧照，没有则按上部裁成 16:9，解决微信/企业微信通知图片不显示或被裁得只剩中间一条"
     plugin_icon = ""
     plugin_version = "1.3"
     plugin_author = "celestial520"
@@ -64,8 +64,8 @@ class DoubanImage(_PluginBase):
     _enabled: bool = False
     # 是否处理竖版封面
     _landscape: bool = True
-    # True=优先用豆瓣横版剧照；False=自己把竖图按上部裁成 16:9
-    _official_first: bool = False
+    # True=优先用豆瓣横版剧照（有就用 A）；False=直接把竖图按上部裁成 16:9（B）
+    _official_first: bool = True
     # 裁剪时保留的顶部起点（0.06 = 从 6% 处开始裁，避开顶部黑边/台标）
     _crop_top: float = 0.06
     # 简单内存缓存：key -> (content, media_type)
@@ -110,7 +110,7 @@ class DoubanImage(_PluginBase):
         if config:
             self._enabled = bool(config.get("enabled"))
             self._landscape = bool(config.get("landscape", True))
-            self._official_first = bool(config.get("official_first", False))
+            self._official_first = bool(config.get("official_first", True))
 
     def stop_service(self):
         self._cache = {}
@@ -212,8 +212,8 @@ class DoubanImage(_PluginBase):
                                                 "该代理需要能从公网访问（企业微信服务器要抓图），"
                                                 "并且同时支持 GET / HEAD 两种请求。"
                                                 "「竖版封面自动转横版」开启时，封面若是 2:3 竖图，"
-                                                "会按上部裁成 16:9（与 MP 网页卡片的观感一致）；"
-                                                "若再打开「优先使用豆瓣横版剧照」，则改用该条目的横版剧照。"
+                                                "先找该条目的官方横版剧照；"
+                                                "找不到横图才按上部裁成 16:9（与 MP 网页卡片的观感一致）。"
                                             ),
                                         },
                                     }
@@ -223,7 +223,7 @@ class DoubanImage(_PluginBase):
                     },
                 ],
             }
-        ], {"enabled": False, "landscape": True, "official_first": False}
+        ], {"enabled": False, "landscape": True, "official_first": True}
 
     def get_page(self) -> List[dict]:
         return []

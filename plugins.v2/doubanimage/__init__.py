@@ -29,8 +29,8 @@ class DoubanImage(_PluginBase):
     plugin_desc = "把通知里的豆瓣海报换成本机代理地址，解决微信/企业微信通知图片不显示"
     plugin_icon = ""
     plugin_version = "1.0"
-    plugin_author = "WorkBuddy"
-    author_url = ""
+    plugin_author = "celestial520"
+    author_url = "https://github.com/celestial520"
     plugin_config_prefix = "doubanimage_"
     plugin_order = 1
     auth_level = 1

@@ -65,12 +65,18 @@ class DoubanImage(_PluginBase):
           豆瓣会对部分请求直接返回 text/html（风控），而 _probe_size 只试一次原始地址，
           一旦被风控就判成"探测不到尺寸"，于是永远走裁剪、永远用不到官方横图。
           本版探测也走镜像子域轮换（img1/2/3/9 + jpg/webp），并限制最多 4 次尝试。
+
+    v1.6：抗风控加固 ——
+          · 所有豆瓣请求加节流（默认 250ms 间隔），避免短时间突发被判为爬虫；
+          · 新增可选的「豆瓣 Cookie」，只随搜索/剧照请求发送，不发往图片 CDN；
+          · 418 单独识别（豆瓣防盗链固定返回 418 + text/html + 空 body）；
+          · 图片请求补 Accept-Language，更接近真实浏览器。
     """
 
     plugin_name = "豆瓣通知图片代理"
     plugin_desc = "把通知里的豆瓣海报换成本机代理地址；竖版封面优先换成官方横版剧照，没有则按上部裁成 16:9，解决微信/企业微信通知图片不显示或被裁得只剩中间一条"
     plugin_icon = ""
-    plugin_version = "1.5"
+    plugin_version = "1.6"
     plugin_author = "celestial520"
     author_url = "https://github.com/celestial520"
     plugin_config_prefix = "doubanimage_"
@@ -84,6 +90,12 @@ class DoubanImage(_PluginBase):
     _official_first: bool = True
     # 裁剪时保留的顶部起点（0.06 = 从 6% 处开始裁，避开顶部黑边/台标）
     _crop_top: float = 0.06
+    # 可选：豆瓣 Cookie（登录态）。只用于 movie.douban.com 搜索与 frodo 接口，
+    # 图片 CDN（img*.doubanio.com）不需要登录态，也不会发送 Cookie。
+    _cookie: str = ""
+    # 请求节流：两次豆瓣请求最小间隔（秒），避免短时间突发被 CDN 限流
+    _min_interval: float = 0.25
+    _last_request_at: float = 0.0
     # 简单内存缓存：key -> (content, media_type)
     _cache: Dict[str, Tuple[bytes, str]] = {}
     _cache_limit: int = 300
@@ -106,7 +118,7 @@ class DoubanImage(_PluginBase):
         "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     )
     # 版本参数：企业微信会按 picurl 缓存抓图结果，带上版本号可绕过旧的失败缓存
-    _cache_buster = "v15"
+    _cache_buster = "v16"
 
     # 豆瓣 App 接口（与 MP 内部 DoubanApi 一致，用于查剧照）
     _api_base = "https://frodo.douban.com/api/v2"
@@ -130,6 +142,7 @@ class DoubanImage(_PluginBase):
             self._enabled = bool(config.get("enabled"))
             self._landscape = bool(config.get("landscape", True))
             self._official_first = bool(config.get("official_first", True))
+            self._cookie = str(config.get("cookie") or "").strip()
 
     def stop_service(self):
         self._cache = {}
@@ -297,9 +310,30 @@ class DoubanImage(_PluginBase):
                             }
                         ],
                     },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "cookie",
+                                            "label": "豆瓣 Cookie（可选）",
+                                            "placeholder": "bid=xxx; dbcl2=xxx; ck=xxx",
+                                            "hint": "只用于搜索与剧照查询，不会发给图片 CDN。不填也能用。",
+                                            "clearable": True,
+                                        },
+                                    }
+                                ],
+                            }
+                        ],
+                    },
                 ],
             }
-        ], {"enabled": False, "landscape": True, "official_first": True}
+        ], {"enabled": False, "landscape": True, "official_first": True, "cookie": ""}
 
     def get_page(self) -> List[dict]:
         return []
@@ -489,13 +523,10 @@ class DoubanImage(_PluginBase):
         该接口是网页端公开接口，不需要签名。
         """
         url = "https://movie.douban.com/j/subject_suggest"
-        headers = {
-            "User-Agent": self._ua,
-            "Referer": "https://movie.douban.com/",
-            "Accept": "application/json, text/javascript, */*; q=0.01",
-        }
+        headers = self._web_headers(json_accept=True)
         data = None
         for proxies in self._proxy_candidates():
+            self._throttle()
             try:
                 resp = requests.get(
                     url, params={"q": name}, headers=headers, timeout=8, proxies=proxies
@@ -618,6 +649,7 @@ class DoubanImage(_PluginBase):
         headers = {"User-Agent": self._api_ua, "Referer": "https://m.douban.com/"}
 
         for proxies in self._proxy_candidates():
+            self._throttle()
             try:
                 resp = requests.get(
                     url, params=params, headers=headers, timeout=6, proxies=proxies
@@ -704,11 +736,7 @@ class DoubanImage(_PluginBase):
                 url,
                 timeout=5,
                 stream=True,
-                headers={
-                    "Referer": self._referer,
-                    "User-Agent": self._ua,
-                    "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-                },
+                headers=self._image_headers(),
             )
         except Exception as err:
             logger.debug(f"候选横图请求异常：{err} {url}")
@@ -771,16 +799,13 @@ class DoubanImage(_PluginBase):
 
         for candidate in list(dict.fromkeys(self._candidates(url)))[:4]:
             buffer = b""
+            self._throttle()
             try:
                 resp = requests.get(
                     candidate,
                     timeout=6,
                     stream=True,
-                    headers={
-                        "Referer": self._referer,
-                        "User-Agent": self._ua,
-                        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-                    },
+                    headers=self._image_headers(),
                 )
             except Exception as err:
                 logger.debug(f"探测图片尺寸异常：{err} {candidate}")
@@ -890,6 +915,58 @@ class DoubanImage(_PluginBase):
         hostname = (parsed.hostname or "").lower().rstrip(".")
         return hostname == "doubanio.com" or hostname.endswith(".doubanio.com")
 
+    # ------------------------------------------------------------------ 请求公共件
+
+    def _throttle(self) -> None:
+        """
+        简单节流：两次豆瓣请求之间至少间隔 _min_interval 秒。
+        豆瓣图片 CDN 在短时间突发请求时会直接返回 418/HTML，
+        放慢一点比任何"绕过"手段都稳。
+        """
+        try:
+            gap = float(self._min_interval or 0)
+            if gap <= 0:
+                return
+            delta = time.time() - float(self._last_request_at or 0)
+            if delta < gap:
+                time.sleep(gap - delta)
+            self._last_request_at = time.time()
+        except Exception:
+            pass
+
+    def _image_headers(self) -> Dict[str, str]:
+        """
+        取图片用的请求头。
+        豆瓣图片 CDN 只认 Referer/UA，不需要登录态，所以这里不带 Cookie
+        （避免把登录票据发给 CDN 节点）。
+        """
+        return {
+            "Referer": self._referer,
+            "User-Agent": self._ua,
+            "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        }
+
+    def _web_headers(self, json_accept: bool = False) -> Dict[str, str]:
+        """
+        访问 movie.douban.com / frodo 接口用的请求头。
+        配了「豆瓣 Cookie」时会带上，登录态能显著降低被要求验证/登录的概率。
+        """
+        headers = {
+            "Referer": self._referer,
+            "User-Agent": self._ua,
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        }
+        headers["Accept"] = (
+            "application/json, text/javascript, */*; q=0.01"
+            if json_accept
+            else "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+        )
+        cookie = str(getattr(self, "_cookie", "") or "").strip()
+        if cookie:
+            headers["Cookie"] = cookie
+        return headers
+
     def plugin_id(self) -> str:
         """
         运行时插件ID。MP 用「插件类名」作为 plugin_id 并拼进路由前缀
@@ -972,23 +1049,24 @@ class DoubanImage(_PluginBase):
 
         detail = ""
         for candidate in dict.fromkeys(self._candidates(url)):
+            self._throttle()
             try:
                 resp = requests.get(
                     candidate,
-                    timeout=15,
-                    headers={
-                        "Referer": self._referer,
-                        "User-Agent": self._ua,
-                        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-                    },
+                    timeout=10,
+                    headers=self._image_headers(),
                 )
             except Exception as err:
                 detail = f"请求异常：{err}"
                 logger.error(f"请求豆瓣图片出错：{err} {candidate}")
                 continue
             if resp.status_code != 200 or not resp.content:
-                detail = f"上游 HTTP {resp.status_code}"
-                logger.warn(f"豆瓣图片返回异常：{resp.status_code} {candidate}")
+                if resp.status_code == 418:
+                    # 豆瓣图片 CDN 的防盗链响应：418 + text/html + 空 body
+                    detail = "上游 418（防盗链，CDN 拒绝了该请求）"
+                else:
+                    detail = f"上游 HTTP {resp.status_code}"
+                logger.warn(f"豆瓣图片返回异常：{resp.status_code} {candidate} -> {detail}")
                 continue
 
             media_type = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()

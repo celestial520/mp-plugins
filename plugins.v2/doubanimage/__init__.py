@@ -159,14 +159,14 @@ class DoubanImage(_PluginBase):
 
     def plugin_id(self) -> str:
         """
-        运行时插件ID（等于插件目录名，MP 路由前缀用的是它）。
-        从模块名推导，避免目录大小写不一致时地址拼错。
+        运行时插件ID。MP 用「插件类名」作为 plugin_id 并拼进路由前缀
+        （见 PluginManager.load_plugins: plugin_id = plugin.__name__），
+        与插件目录名的大小写无关，所以这里必须取类名。
         """
         try:
-            module = type(self).__module__
-            pid = module.rsplit(".", 1)[-1]
-            if pid and pid not in ("__init__", ""):
-                return pid.lower()
+            name = type(self).__name__
+            if name:
+                return name
         except Exception:
             pass
         return "doubanimage"

@@ -49,12 +49,23 @@ class DoubanImage(_PluginBase):
           本版两级策略：
             ① 该条目豆瓣剧照里若有横图（宽高比≥1.35），直接用官方横图；
             ② 没有横图时，用 Pillow 把竖图**按上部**裁成 16:9（复现网页观感）。
+
+    v1.4：修复 v1.3 完全没生效 ——
+          MP 的 post_message 钩子只会传 message，**从不传 mediainfo**
+          （见 ChainBase.post_message → messagequeue.send_message("post_message", message=...)），
+          而 v1.3 的横版处理第一行就是 `if mediainfo is None: return`，
+          所以竖图从来没被处理过，企业微信照旧从正中裁。
+          本版改为不依赖 mediainfo：
+            · 从通知标题反查豆瓣条目（/j/subject_suggest）拿到 douban_id；
+            · 查不到条目或没有横图时，让代理端按上部裁成 16:9；
+            · 代理端再加一道兜底：任何竖图默认自动裁成 16:9，
+              即使钩子没来得及加参数也不会再出现"正中裁躯干"。
     """
 
     plugin_name = "豆瓣通知图片代理"
     plugin_desc = "把通知里的豆瓣海报换成本机代理地址；竖版封面优先换成官方横版剧照，没有则按上部裁成 16:9，解决微信/企业微信通知图片不显示或被裁得只剩中间一条"
     plugin_icon = ""
-    plugin_version = "1.3"
+    plugin_version = "1.4"
     plugin_author = "celestial520"
     author_url = "https://github.com/celestial520"
     plugin_config_prefix = "doubanimage_"
@@ -76,6 +87,9 @@ class DoubanImage(_PluginBase):
     # 横版图缓存：douban_id -> (url, 时间戳)；url 为 None 表示查过但没有
     _landscape_cache: Dict[str, Tuple[Optional[str], float]] = {}
     _landscape_ttl: int = 6 * 3600
+    # 标题 -> 豆瓣条目缓存：query -> (ctx, 时间戳)
+    _subject_cache: Dict[str, Tuple[dict, float]] = {}
+    _subject_ttl: int = 24 * 3600
     # 诊断信息（最近若干次改写 / 抓取 / 横版替换）
     _rewrites: Deque[dict] = deque(maxlen=20)
     _hits: Deque[dict] = deque(maxlen=40)
@@ -87,7 +101,7 @@ class DoubanImage(_PluginBase):
         "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     )
     # 版本参数：企业微信会按 picurl 缓存抓图结果，带上版本号可绕过旧的失败缓存
-    _cache_buster = "v13"
+    _cache_buster = "v14"
 
     # 豆瓣 App 接口（与 MP 内部 DoubanApi 一致，用于查剧照）
     _api_base = "https://frodo.douban.com/api/v2"
@@ -250,10 +264,12 @@ class DoubanImage(_PluginBase):
             self._record_rewrite(None, None, "该通知没有图片，跳过")
             return
 
-        # 关键：竖版封面 -> 横版（裁剪或换剧照）
+        # 关键：竖版封面 -> 横版（优先官方横图，没有则裁上部）
+        # 注意：MP 的钩子不会传 mediainfo，所以条目信息要靠标题反查
+        ctx = self._resolve_context(message, mediainfo)
         final_image, extra = image, {}
         try:
-            final_image, extra = self.ensure_landscape(image, mediainfo)
+            final_image, extra = self.ensure_landscape(image, ctx)
         except Exception as err:
             logger.warn(f"横版封面处理失败，继续使用原图：{err}")
             final_image, extra = image, {}
@@ -278,43 +294,201 @@ class DoubanImage(_PluginBase):
 
     # ------------------------------------------------------------------ 横版处理
 
-    def ensure_landscape(self, image: str, mediainfo) -> Tuple[str, Dict[str, Any]]:
+    def ensure_landscape(
+        self, image: str, ctx: Optional[dict] = None
+    ) -> Tuple[str, Dict[str, Any]]:
         """
         封面若是竖图，返回「横版地址 + 额外参数」：
-          - 默认：地址不变，交给代理端按上部裁成 16:9
-          - 打开「优先使用豆瓣横版剧照」：先尝试换成本条目的横版剧照
+          - 打开「优先使用豆瓣横版剧照」：先尝试换成本条目的官方横版剧照（A）
+          - 没有官方横图：地址不变，交给代理端按上部裁成 16:9（B）
+        ctx 由 _resolve_context() 得到，包含 douban_id / is_movie 等信息。
         """
-        if not self._landscape or mediainfo is None:
+        if not self._landscape:
             return image, {}
         if not self.is_douban_image(image):
             return image, {}
 
         size = self._probe_size(image)
         if not size:
-            self._record_landscape(image, None, "无法探测尺寸，保持原图")
-            return image, {}
+            # 探测不到尺寸也照样让代理端兜底裁，避免又回到"正中裁"
+            self._record_landscape(image, None, "无法探测尺寸，交由代理端兜底裁剪")
+            return image, {"fit": "16x9", "top": self._crop_top}
         width, height = size
         ratio = width / float(height or 1)
         if ratio >= self._landscape_ratio:
             self._record_landscape(image, None, f"{width}x{height} 已是横图，无需处理")
             return image, {}
 
-        douban_id = str(getattr(mediainfo, "douban_id", "") or "").strip()
-        if self._official_first and douban_id:
-            landscape = self._find_landscape(douban_id, self._is_movie(mediainfo))
-            if landscape:
+        ctx = ctx or {}
+        douban_id = str(ctx.get("douban_id") or "").strip()
+        if self._official_first:
+            if douban_id:
+                landscape = self._find_landscape(douban_id, bool(ctx.get("is_movie", True)))
+                if landscape:
+                    self._record_landscape(
+                        image,
+                        landscape,
+                        f"{width}x{height} 竖图 -> 官方横版剧照"
+                        f"（条目 {douban_id}，来源：{ctx.get('from') or '标题反查'}）",
+                    )
+                    return landscape, {}
                 self._record_landscape(
-                    image, landscape, f"{width}x{height} 竖图 -> 豆瓣横版剧照"
+                    image,
+                    None,
+                    f"{width}x{height} 竖图，条目 {douban_id} 没有可用横图，改裁上部",
                 )
-                return landscape, {}
-            self._record_landscape(
-                image, None, f"{width}x{height} 竖图，豆瓣没有可用横图，改裁上部"
-            )
+            else:
+                self._record_landscape(
+                    image,
+                    None,
+                    f"{width}x{height} 竖图，未解析到豆瓣条目，改裁上部",
+                )
 
         self._record_landscape(
             image, None, f"{width}x{height} 竖图 -> 代理端按上部裁成 16:9"
         )
         return image, {"fit": "16x9", "top": self._crop_top}
+
+    # ------------------------------------------------------------------ 条目解析
+
+    # 通知标题里的干扰词（订阅/下载/入库等状态描述）
+    _title_noise = (
+        "已添加订阅", "添加订阅", "已退订", "开始下载", "下载完成", "下载失败",
+        "整理入库", "已入库", "入库完成", "入库", "开始搜索", "搜索结果",
+        "更新", "已更新", "订阅", "完成", "成功", "失败", "通知",
+    )
+
+    def _resolve_context(self, message, mediainfo=None) -> dict:
+        """
+        mp 的 post_message 钩子只传 message，不传 mediainfo，
+        所以这里先从 mediainfo 取（老版本兼容），取不到再用通知标题反查豆瓣。
+        """
+        # 1) 有 mediainfo 就直接用（某些调用方会传）
+        if mediainfo is not None:
+            douban_id = str(getattr(mediainfo, "douban_id", "") or "").strip()
+            if douban_id:
+                return {
+                    "douban_id": douban_id,
+                    "is_movie": self._is_movie(mediainfo),
+                    "from": "mediainfo",
+                }
+
+        # 2) 从标题/正文里解析片名与年份，再查豆瓣条目
+        title = ""
+        text = ""
+        try:
+            title = str(getattr(message, "title", "") or "")
+            text = str(getattr(message, "text", "") or "")
+        except Exception:
+            pass
+        name, year = self._parse_title(title, text)
+        if not name:
+            return {}
+        key = f"{name}|{year}"
+        cached = self._subject_cache.get(key)
+        if cached and time.time() - cached[1] < self._subject_ttl:
+            return cached[0]
+        ctx = self._search_subject(name, year) or {}
+        self._subject_cache[key] = (ctx, time.time())
+        if len(self._subject_cache) > self._cache_limit:
+            self._subject_cache.clear()
+        return ctx
+
+    def _parse_title(self, title: str, text: str = "") -> Tuple[str, str]:
+        """
+        从通知标题解析 (片名, 年份)。
+        典型标题：'我不是大师 (2026) S01 已添加订阅' / '【豆瓣】我不是大师 (2026) 开始下载'
+        """
+        raw = (title or "").strip() or (text or "").strip()
+        if not raw:
+            return "", ""
+        # 去掉 HTML 标签与常见前缀
+        raw = re.sub(r"<[^>]+>", " ", raw)
+        raw = re.sub(r"^[【\[（(][^】\]）)]{0,8}[】\]）)]", " ", raw).strip()
+        match = re.match(
+            r"^(?P<name>.{1,40}?)\s*[（(\[]\s*(?P<year>(?:19|20)\d{2})\s*[)）\]]",
+            raw,
+        )
+        if match:
+            return match.group("name").strip(" -·:："), match.group("year")
+        # 没年份：取首行/首段，再剥掉状态词与季集标记
+        name = re.split(r"[\n\r|｜]", raw)[0]
+        name = re.sub(r"[（(]\s*S\d{1,2}(E\d{1,4})?\s*[)）]", " ", name, flags=re.I)
+        name = re.sub(r"\bS\d{1,2}(E\d{1,4})?\b", " ", name, flags=re.I)
+        for noise in self._title_noise:
+            name = name.replace(noise, " ")
+        name = re.sub(r"[（(]\s*(19|20)\d{2}\s*[)）]", " ", name)
+        name = re.sub(r"[\s\-—·:：]+", " ", name).strip()
+        return name[:40], ""
+
+    def _search_subject(self, name: str, year: str = "") -> Optional[dict]:
+        """
+        用豆瓣的建议接口按片名查条目，返回 {douban_id, is_movie, from}。
+        该接口是网页端公开接口，不需要签名。
+        """
+        url = "https://movie.douban.com/j/subject_suggest"
+        headers = {
+            "User-Agent": self._ua,
+            "Referer": "https://movie.douban.com/",
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+        }
+        data = None
+        for proxies in self._proxy_candidates():
+            try:
+                resp = requests.get(
+                    url, params={"q": name}, headers=headers, timeout=8, proxies=proxies
+                )
+            except Exception as err:
+                logger.debug(f"豆瓣搜索请求异常：{err}")
+                continue
+            if resp.status_code != 200:
+                continue
+            try:
+                data = resp.json()
+            except Exception:
+                continue
+            if isinstance(data, list):
+                break
+        if not isinstance(data, list) or not data:
+            logger.info(f"豆瓣搜索没有结果：{name}（{year}）")
+            return None
+
+        best: Optional[Tuple[int, dict]] = None
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            douban_id = str(item.get("id") or "").strip()
+            if not douban_id:
+                continue
+            title = str(item.get("title") or "").strip()
+            sub_title = str(item.get("sub_title") or "").strip()
+            item_year = str(item.get("year") or "").strip()
+            score = 0
+            if self._norm_title(title) == self._norm_title(name):
+                score += 100
+            elif self._norm_title(name) and self._norm_title(name) in self._norm_title(sub_title):
+                score += 40
+            if year and item_year == str(year):
+                score += 60
+            elif year and item_year:
+                score -= 30
+            # 建议接口的 type 不可靠（剧集也会标 movie），这里只作为初值
+            is_movie = str(item.get("type") or "").lower() != "tv"
+            candidate = {
+                "douban_id": douban_id,
+                "is_movie": is_movie,
+                "from": f"标题反查 {name}{(' ' + year) if year else ''}",
+            }
+            if best is None or score > best[0]:
+                best = (score, candidate)
+        if not best or best[0] <= 0:
+            logger.info(f"豆瓣搜索结果匹配度不足，放弃：{name}（{year}）")
+            return None
+        return best[1]
+
+    @staticmethod
+    def _norm_title(value: str) -> str:
+        return re.sub(r"[\s·:：\-—_（）()\[\]【】,.，。!！?？'\"“”‘’]+", "", value or "")
 
     @staticmethod
     def _is_movie(mediainfo) -> bool:
@@ -339,13 +513,19 @@ class DoubanImage(_PluginBase):
     def _find_landscape(self, douban_id: str, is_movie: bool) -> Optional[str]:
         """
         查豆瓣剧照，返回一张横版大图地址（带缓存）。
+        剧照接口分 movie / tv，而搜索接口给的 type 不一定准，
+        所以先用推断的类型查，查不到再换另一种。
         """
-        key = f"{'movie' if is_movie else 'tv'}:{douban_id}"
+        key = str(douban_id)
         cached = self._landscape_cache.get(key)
         if cached and time.time() - cached[1] < self._landscape_ttl:
             return cached[0]
 
-        photos = self._fetch_photos(douban_id, is_movie)
+        photos = None
+        for kind_movie in (is_movie, not is_movie):
+            photos = self._fetch_photos(douban_id, kind_movie)
+            if photos:
+                break
         picked = None
         if photos:
             for candidate in self._landscape_candidates(photos)[:3]:
@@ -803,29 +983,34 @@ class DoubanImage(_PluginBase):
         request: Request,
         url: str = Query(..., description="豆瓣图片地址"),
         fit: Optional[str] = Query(None, description="横版裁剪：16x9"),
-        top: float = Query(0.06, description="裁剪起点（0~0.45）"),
+        top: Optional[float] = Query(None, description="裁剪起点（0~0.45），默认取插件设置"),
+        auto: int = Query(1, description="未指定 fit 时，竖图自动裁成 16:9（1=开）"),
     ):
         """
         匿名图片代理：补 Referer 取图后返回。
         HEAD 只回响应头（企业微信抓封面时用 HEAD 探测），GET 回完整图片。
-        fit=16x9 时按上部裁成横版后再返回。
+        fit=16x9 时按上部裁成横版后再返回；未指定 fit 且 auto=1 时，
+        竖图也会自动裁成 16:9（兜底，防止钩子没来得及加参数又变回正中裁）。
         """
         if not self._enabled:
             return Response(status_code=404)
         if not url or not self.is_douban_image(url):
             return Response(status_code=400)
 
+        crop_top = float(top) if top is not None else float(self._crop_top)
+        want_crop = (fit or "").lower() == "16x9" or (bool(auto) and not fit)
+
         cache_key = url
-        if fit:
-            cache_key = f"{url}|{fit}|{round(float(top or 0), 3)}"
+        if want_crop:
+            cache_key = f"{url}|crop|{round(crop_top, 3)}"
 
         content, media_type, detail = self._fetch(url, cache_key)
         if not content:
             self._record_hit(request, 502, 0, detail)
             return Response(status_code=502)
 
-        if fit and fit.lower() == "16x9":
-            cropped = self._crop_landscape(content, float(top or 0))
+        if want_crop:
+            cropped = self._crop_landscape(content, crop_top)
             if cropped:
                 content = cropped
                 media_type = "image/jpeg"
@@ -858,6 +1043,7 @@ class DoubanImage(_PluginBase):
             "cache_size": len(self._cache),
             "size_cache": len(self._size_cache),
             "landscape_cache": len(self._landscape_cache),
+            "subject_cache": len(self._subject_cache),
             "rewrites": list(self._rewrites),
             "landscape_logs": list(self._landscape_logs),
             "hits": list(self._hits),

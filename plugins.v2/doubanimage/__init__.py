@@ -157,7 +157,64 @@ class DoubanImage(_PluginBase):
                 "description": "查看最近的地址改写、横版替换与图片抓取记录，用于排查封面问题",
                 "allow_anonymous": True,
             },
+            {
+                "path": "/diag",
+                "endpoint": self.diag,
+                "methods": ["GET"],
+                "summary": "条目解析与横图查找诊断",
+                "description": "传入 title 或 name+year，在容器内实际跑一遍标题反查与横图查找，返回结果",
+                "allow_anonymous": True,
+            },
         ]
+
+    def diag(
+        self,
+        title: str = Query("", description="通知标题，如「我不是大师 (2026) S01 已添加订阅」"),
+        name: str = Query("", description="片名（可替代 title）"),
+        year: str = Query("", description="年份"),
+        image: str = Query("", description="可选：要探测的封面地址"),
+    ):
+        """
+        诊断接口：在 MP 容器内部实际执行一次「标题解析 -> 豆瓣反查 -> 找官方横图」，
+        用来确认容器网络能否访问豆瓣、以及反查结果是否正确。
+        """
+        parsed_name, parsed_year = self._parse_title(title, "")
+        query_name = name or parsed_name
+        query_year = year or parsed_year
+        result: Dict[str, Any] = {
+            "input_title": title,
+            "parsed_name": parsed_name,
+            "parsed_year": parsed_year,
+            "query_name": query_name,
+            "query_year": query_year,
+            "subject": None,
+            "landscape": None,
+            "image_size": None,
+            "error": None,
+        }
+        if not query_name:
+            result["error"] = "没能从标题解析出片名，请直接传 name"
+            return result
+        try:
+            ctx = self._search_subject(query_name, query_year)
+        except Exception as err:
+            result["error"] = f"搜索异常：{err}"
+            return result
+        result["subject"] = ctx
+        if ctx and ctx.get("douban_id"):
+            try:
+                result["landscape"] = self._find_landscape(
+                    str(ctx["douban_id"]), bool(ctx.get("is_movie", True))
+                )
+            except Exception as err:
+                result["error"] = f"查剧照异常：{err}"
+        if image:
+            try:
+                size = self._probe_size(image)
+                result["image_size"] = list(size) if size else None
+            except Exception as err:
+                result["error"] = f"探测尺寸异常：{err}"
+        return result
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         return [

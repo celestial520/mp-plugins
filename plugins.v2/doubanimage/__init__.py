@@ -60,12 +60,17 @@ class DoubanImage(_PluginBase):
             · 查不到条目或没有横图时，让代理端按上部裁成 16:9；
             · 代理端再加一道兜底：任何竖图默认自动裁成 16:9，
               即使钩子没来得及加参数也不会再出现"正中裁躯干"。
+
+    v1.5：修复 A 方案（官方横图）轮不上 ——
+          豆瓣会对部分请求直接返回 text/html（风控），而 _probe_size 只试一次原始地址，
+          一旦被风控就判成"探测不到尺寸"，于是永远走裁剪、永远用不到官方横图。
+          本版探测也走镜像子域轮换（img1/2/3/9 + jpg/webp），并限制最多 4 次尝试。
     """
 
     plugin_name = "豆瓣通知图片代理"
     plugin_desc = "把通知里的豆瓣海报换成本机代理地址；竖版封面优先换成官方横版剧照，没有则按上部裁成 16:9，解决微信/企业微信通知图片不显示或被裁得只剩中间一条"
     plugin_icon = ""
-    plugin_version = "1.4"
+    plugin_version = "1.5"
     plugin_author = "celestial520"
     author_url = "https://github.com/celestial520"
     plugin_config_prefix = "doubanimage_"
@@ -101,7 +106,7 @@ class DoubanImage(_PluginBase):
         "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     )
     # 版本参数：企业微信会按 picurl 缓存抓图结果，带上版本号可绕过旧的失败缓存
-    _cache_buster = "v14"
+    _cache_buster = "v15"
 
     # 豆瓣 App 接口（与 MP 内部 DoubanApi 一致，用于查剧照）
     _api_base = "https://frodo.douban.com/api/v2"
@@ -757,43 +762,55 @@ class DoubanImage(_PluginBase):
         """
         读取图片头部，解析真实宽高（不依赖 Pillow）。
         支持 JPEG / PNG / WebP。
+        豆瓣会对某些请求直接返回 text/html（风控），所以这里同样走镜像轮换，
+        否则一次被风控就判成"探测不到尺寸"，A 方案（官方横图）就永远轮不上。
         """
         cached = self._size_cache.get(url)
         if cached:
             return cached
-        candidate = self.prefer_jpeg_url(url)
-        try:
-            resp = requests.get(
-                candidate,
-                timeout=8,
-                stream=True,
-                headers={
-                    "Referer": self._referer,
-                    "User-Agent": self._ua,
-                    "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-                },
-            )
-            if resp.status_code != 200:
-                logger.debug(f"探测图片尺寸失败：HTTP {resp.status_code} {candidate}")
-                return None
+
+        for candidate in list(dict.fromkeys(self._candidates(url)))[:4]:
             buffer = b""
             try:
+                resp = requests.get(
+                    candidate,
+                    timeout=6,
+                    stream=True,
+                    headers={
+                        "Referer": self._referer,
+                        "User-Agent": self._ua,
+                        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+                    },
+                )
+            except Exception as err:
+                logger.debug(f"探测图片尺寸异常：{err} {candidate}")
+                continue
+            try:
+                if resp.status_code != 200:
+                    logger.debug(f"探测图片尺寸失败：HTTP {resp.status_code} {candidate}")
+                    continue
                 for chunk in resp.iter_content(8192):
                     buffer += chunk
                     if len(buffer) >= 65536:
                         break
+            except Exception as err:
+                logger.debug(f"读取图片头部异常：{err} {candidate}")
+                continue
             finally:
-                resp.close()
-        except Exception as err:
-            logger.debug(f"探测图片尺寸异常：{err} {candidate}")
-            return None
+                try:
+                    resp.close()
+                except Exception:
+                    pass
 
-        size = self._parse_image_size(buffer)
-        if size:
-            if len(self._size_cache) > self._cache_limit:
-                self._size_cache.clear()
-            self._size_cache[url] = size
-        return size
+            size = self._parse_image_size(buffer)
+            if size:
+                if len(self._size_cache) > self._cache_limit:
+                    self._size_cache.clear()
+                self._size_cache[url] = size
+                return size
+            logger.debug(f"图片头部无法解析（可能被风控返回 HTML）：{candidate}")
+
+        return None
 
     @staticmethod
     def _parse_image_size(data: bytes) -> Optional[Tuple[int, int]]:

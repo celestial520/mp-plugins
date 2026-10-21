@@ -32,9 +32,9 @@ class U115TransferNotify(_PluginBase):
     """
 
     plugin_name = "115秒传助手·整理通知"
-    plugin_desc = "MoviePilot 整理完成后，把整理出来的文件直接推给 115秒传助手，让它立刻尝试秒传"
+    plugin_desc = "MoviePilot 整理完成后，把整理出来的文件夹（或文件清单）推给 115秒传助手，让它立刻尝试秒传"
     plugin_icon = ""
-    plugin_version = "1.0"
+    plugin_version = "1.1"
     plugin_author = "celestial520"
     author_url = "https://github.com/celestial520/mp-plugins"
     plugin_config_prefix = "u115transfernotify_"
@@ -45,6 +45,7 @@ class U115TransferNotify(_PluginBase):
     _enabled: bool = False
     _helper_url: str = ""
     _api_key: str = ""
+    _push_mode: str = "dir"           # dir=推整理后的文件夹 / files=推文件清单
     _path_map_raw: str = ""
     _include_all_files: bool = True
     _include_sub: bool = False
@@ -62,6 +63,7 @@ class U115TransferNotify(_PluginBase):
             self._enabled = bool(config.get("enabled"))
             self._helper_url = str(config.get("helper_url") or "").strip().rstrip("/")
             self._api_key = str(config.get("api_key") or "").strip()
+            self._push_mode = str(config.get("push_mode") or "dir").strip()
             self._path_map_raw = str(config.get("path_map") or "")
             self._include_all_files = bool(config.get("include_all_files", True))
             self._include_sub = bool(config.get("include_sub", False))
@@ -146,18 +148,31 @@ class U115TransferNotify(_PluginBase):
 
     def _collect_paths(self, info) -> List[str]:
         """
-        取整理后的目标文件路径
+        取整理后的目标路径：
+          dir   -> 整理出来的文件夹（整批一起交给助手，附属文件也不会漏）
+          files -> file_list_new 里的文件清单
         """
+        target_dir = getattr(info, "target_diritem", None)
         target_item = getattr(info, "target_item", None)
+
+        if self._push_mode == "dir":
+            path = str(getattr(target_dir, "path", "") or "") if target_dir else ""
+            if not path and target_item is not None:
+                # 没有目录项（单文件整理）就退回文件本身
+                path = str(getattr(target_item, "path", "") or "")
+            return [path] if path else []
+
         if not self._include_all_files and target_item is not None:
             path = str(getattr(target_item, "path", "") or "")
             return [path] if path else []
+
         files = getattr(info, "file_list_new", None) or []
         paths = [str(x) for x in files if str(x).strip()]
-        if not paths and target_item is not None:
-            path = str(getattr(target_item, "path", "") or "")
-            if path:
-                paths = [path]
+        if not paths:
+            if target_dir is not None and getattr(target_dir, "path", None):
+                paths = [str(target_dir.path)]
+            elif target_item is not None and getattr(target_item, "path", None):
+                paths = [str(target_item.path)]
         return paths[:200]
 
     # ---------------------------------------------------------------- 路径映射
@@ -365,6 +380,30 @@ class U115TransferNotify(_PluginBase):
                                 "props": {"cols": 12, "md": 6},
                                 "content": [
                                     {
+                                        "component": "VSelect",
+                                        "props": {
+                                            "model": "push_mode",
+                                            "label": "推送什么给助手",
+                                            "items": [
+                                                {
+                                                    "title": "整理后的文件夹（推荐）",
+                                                    "value": "dir",
+                                                },
+                                                {
+                                                    "title": "文件清单（只推具体文件）",
+                                                    "value": "files",
+                                                },
+                                            ],
+                                            "hint": "推文件夹的话，助手会把里面的文件连同子目录一起处理，附属文件也不会漏",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
                                         "component": "VTextField",
                                         "props": {
                                             "model": "helper_url",
@@ -402,11 +441,11 @@ class U115TransferNotify(_PluginBase):
                                         "component": "VTextarea",
                                         "props": {
                                             "model": "path_map",
-                                            "label": "路径映射（每行一条）",
-                                            "rows": 4,
-                                            "placeholder": "/media => /watch\n/mnt/media => /watch",
-                                            "hint": "MP 容器里的路径 => 助手容器里的路径；两边一样就留空。"
-                                            "左边要能覆盖整理后的文件路径，右边要落在助手的某个监控目录里",
+                                            "label": "路径映射（两边路径不一样时才填）",
+                                            "rows": 3,
+                                            "placeholder": "# 一般不用填\n# /media => /watch",
+                                            "hint": "如果 MP 和助手挂的是同一个目录、容器内路径也一样，这里留空即可。"
+                                            "不一样就写「MP里的路径 => 助手里的路径」，右边要落在助手的某个监控目录内",
                                         },
                                     }
                                 ],
@@ -458,9 +497,10 @@ class U115TransferNotify(_PluginBase):
                                             "type": "info",
                                             "variant": "tonal",
                                             "text": (
-                                                "MP 整理会把文件从下载目录搬到媒体库，"
-                                                "所以这里是把「整理后的真实路径」直接推给助手，"
-                                                "助手收到就立刻尝试秒传，不用等每日扫描。"
+                                                "MP 整理完成后，插件把「整理出来的文件夹」告诉助手，"
+                                                "助手收到就立刻对这个文件夹做秒传（目录结构照原样建到 115）。"
+                                                "所以助手的监控目录里要配成 MP 的媒体库目录，"
+                                                "两边路径一致时「路径映射」留空即可。"
                                                 "保存后可以点插件菜单里的「测试与助手连通性」确认配置。"
                                             ),
                                         },
@@ -473,6 +513,7 @@ class U115TransferNotify(_PluginBase):
             }
         ], {
             "enabled": False,
+            "push_mode": "dir",
             "helper_url": "",
             "api_key": "",
             "path_map": "",

@@ -46,7 +46,7 @@ class U115RapidUpload(_PluginBase):
     plugin_icon = ""
     plugin_version = "1.1"
     plugin_author = "celestial520"
-    author_url = "https://github.com/celestial520"
+    author_url = "https://github.com/celestial520/mp-plugins"
     plugin_config_prefix = "u115rapid_"
     plugin_order = 20
     auth_level = 1

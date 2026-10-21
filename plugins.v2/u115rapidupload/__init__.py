@@ -45,7 +45,7 @@ class U115RapidUpload(_PluginBase):
     plugin_name = "115秒传搬运"
     plugin_desc = "监控本地目录（支持下载器监控/目录实时监控/定时巡逻三种触发），能秒传就传 115、通知并删除源文件；不能秒传先拦截，之后每天再验证"
     plugin_icon = ""
-    plugin_version = "1.3"
+    plugin_version = "1.4"
     plugin_author = "celestial520"
     author_url = "https://github.com/celestial520/mp-plugins"
     plugin_config_prefix = "u115rapid_"
@@ -124,12 +124,14 @@ class U115RapidUpload(_PluginBase):
             self._retry_time = self._normalize_daily_time(config.get("retry_time")) or "09:00"
             self._min_size_mb = self._to_int(config.get("min_size_mb"), 100, 0, 1024 * 1024)
             self._ext_filter = str(config.get("ext_filter") or "").strip()
-            mode = str(config.get("transfer_mode") or "").strip().lower()
-            if mode not in ("move", "copy"):
-                # 兼容旧配置：没有 transfer_mode 时按原来的开关推导
-                mode = "move" if bool(config.get("delete_source", True)) else "copy"
-            self._transfer_mode = mode
-            self._delete_source = mode == "move"
+            # 「秒传后删除源文件」是独立开关；transfer_mode 只是老配置的兼容
+            if "delete_source" in config:
+                self._delete_source = bool(config.get("delete_source"))
+            elif "transfer_mode" in config:
+                self._delete_source = str(config.get("transfer_mode")) != "copy"
+            else:
+                self._delete_source = True
+            self._transfer_mode = "move" if self._delete_source else "copy"
             self._real_upload = bool(config.get("real_upload", False))
             self._notify = bool(config.get("notify", True))
             self._notify_hold = bool(config.get("notify_hold", True))
@@ -1264,23 +1266,10 @@ class U115RapidUpload(_PluginBase):
                                 "props": {"cols": 12, "md": 4},
                                 "content": [
                                     {
-                                        "component": "VSelect",
+                                        "component": "VSwitch",
                                         "props": {
-                                            "model": "transfer_mode",
-                                            "label": "秒传后的处理方式",
-                                            "items": [
-                                                {
-                                                    "title": "移动（删除本地源文件）",
-                                                    "value": "move",
-                                                },
-                                                {
-                                                    "title": "复制（保留本地源文件）",
-                                                    "value": "copy",
-                                                },
-                                            ],
-                                            "item-title": "title",
-                                            "item-value": "value",
-                                            "hint": "只影响本地文件；115 网盘上的文件两种方式都会创建",
+                                            "model": "delete_source",
+                                            "label": "秒传成功后删除本地源文件",
                                         },
                                     }
                                 ],
@@ -1548,8 +1537,8 @@ class U115RapidUpload(_PluginBase):
                                             "variant": "tonal",
                                             "text": (
                                                 "工作流程：发现监控目录里白名单文件 → 计算特征值 → 调 115 秒传接口验证。"
-                                                "能秒传：创建网盘文件、发通知，再按上面选的"
-                                                "「移动」删掉本地源文件 /「复制」保留本地源文件"
+                                                "能秒传：网盘里创建一份（复制语义）、发通知；"
+                                                "本地源文件删不删由「秒传成功后删除本地源文件」这个独立开关决定"
                                                 "（空文件夹统一留到每天定时清理）。"
                                                 "不能秒传：原样保留，等到「第二天设定的时间」再验证。"
                                                 "触发方式三种可同时开：下载器监控 / 目录监控 / 巡逻扫描。"
@@ -1573,7 +1562,7 @@ class U115RapidUpload(_PluginBase):
             "retry_time": "09:00",
             "min_size_mb": 100,
             "ext_filter": "mkv,mp4,ts,iso,m2ts,avi,rmvb,flac,ape,wav",
-            "transfer_mode": "move",
+            "delete_source": True,
             "real_upload": False,
             "cleanup_enabled": True,
             "cleanup_time": "03:30",

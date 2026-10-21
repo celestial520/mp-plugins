@@ -14,17 +14,22 @@
       "v1.4": "修复 v1.3 完全没生效（根因）：MP 的 post_message 钩子只传 message、从不传 mediainfo，而 v1.3 第一行就 return，导致竖图从未被处理。本版改为从通知标题反查豆瓣条目（/j/subject_suggest）拿 douban_id，不再依赖 mediainfo；剧照接口 movie/tv 两种类型都试；代理接口新增自动兜底：任何竖图默认按上部裁成 16:9，即使参数丢失也不会再被企业微信正中裁",
       "v1.5": "修复官方横图（A）轮不上：豆瓣风控会直接返回 text/html，而探测尺寸只试一次原始地址，一被风控就判成探测失败、永远走裁剪。本版探测也走镜像子域轮换（img1/2/3/9 + jpg/webp，最多 4 次）",
       "v1.6": "抗风控加固：所有豆瓣请求加节流（250ms 间隔）；新增可选「豆瓣 Cookie」（只发给搜索/剧照接口，不发往图片 CDN）；418 单独识别为防盗链；图片请求补 Accept-Language"
-    }
+    },
+    "author_url": "https://github.com/celestial520/mp-plugins",
+    "repo_url": "https://github.com/celestial520/mp-plugins"
   },
   "U115RapidUpload": {
     "name": "115秒传搬运",
-    "description": "监控本地目录，文件落进来先验证 115 能否秒传：能秒传就创建网盘文件、发微信通知并删除源文件；不能秒传则原样拦截，按设定的间隔（默认 24 小时）再验证。直接复用 MoviePilot 里已授权的 115 网盘（OpenAPI/扫码），插件本身不保存任何账号信息。",
+    "description": "监控本地目录，文件能秒传就创建 115 网盘文件、发通知并删除源文件；不能秒传先拦截，之后按设定再验证。触发方式支持三种并可同时开启：下载器监控（下载完成立即触发）、目录监控（文件系统实时事件）、每日定时巡逻。直接复用 MoviePilot 已授权的 115 网盘（OpenAPI/扫码），插件本身不保存账号信息。",
     "labels": "网盘",
-    "version": "1.0",
+    "version": "1.1",
     "author": "celestial520",
     "level": 1,
     "history": {
-      "v1.0": "首个版本：监控目录 + SHA1/前128MB 特征值计算 + 调用 115 开放平台 /open/upload/init 验证秒传 + 成功删源并发通知 + 失败拦截并按小时数重试；复用 MP 已授权的 115 存储实例（无需重复登录）"
-    }
+      "v1.0": "首个版本：监控目录 + SHA1/前128MB 特征值计算 + 调用 115 开放平台 /open/upload/init 验证秒传 + 成功删源并发通知 + 失败拦截并按小时数重试；复用 MP 已授权的 115 存储实例（无需重复登录）",
+      "v1.1": "新增三种触发源：①下载器监控——查 MP 各下载器已完成任务，保存路径落在监控目录内立即处理；②目录监控——watchfiles 实时监听监控目录，文件写入静置后立即处理；③每日定时巡逻——可设定 HH:MM，到点把所有拦截中的文件重新验证一遍。另外补上 author_url/repo_url，修复「项目主页」空白"
+    },
+    "author_url": "https://github.com/celestial520/mp-plugins",
+    "repo_url": "https://github.com/celestial520/mp-plugins"
   }
 }

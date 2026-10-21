@@ -16,6 +16,7 @@
 """
 
 import hashlib
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -41,9 +42,9 @@ class U115RapidUpload(_PluginBase):
     """
 
     plugin_name = "115秒传搬运"
-    plugin_desc = "监控本地目录，文件能秒传就传 115、通知并删除源文件；不能秒传就先拦截，第二天再验证"
+    plugin_desc = "监控本地目录（支持下载器监控/目录实时监控/定时巡逻三种触发），能秒传就传 115、通知并删除源文件；不能秒传先拦截，之后每天再验证"
     plugin_icon = ""
-    plugin_version = "1.0"
+    plugin_version = "1.1"
     plugin_author = "celestial520"
     author_url = "https://github.com/celestial520"
     plugin_config_prefix = "u115rapid_"
@@ -76,6 +77,14 @@ class U115RapidUpload(_PluginBase):
     _notify: bool = True
     # 首次拦截时也发通知
     _notify_hold: bool = True
+    # 目录监控：用文件系统事件实时感知新文件
+    _trigger_watch: bool = True
+    # 文件事件落定等待（秒）：最后一次写入后静置多久才处理
+    _watch_settle_sec: int = 60
+    # 下载器监控：查 MP 下载器里已完成的任务，命中监控目录就立刻触发
+    _trigger_downloader: bool = True
+    # 每日定时巡逻（HH:MM，留空关闭）
+    _daily_time: str = ""
 
     # ---------------------------------------------------------------- 运行时
     _state: Dict[str, dict] = {}
@@ -83,6 +92,13 @@ class U115RapidUpload(_PluginBase):
     _last_run_at: float = 0.0
     _last_result: List[dict] = []
     _pending_tasks: List[dict] = []
+    # 文件系统事件待处理：path -> 最后一次变化的 mtime/时间戳
+    _fs_pending: Dict[str, float] = {}
+    _stop_watch: Optional[threading.Event] = None
+    _watch_thread: Optional[threading.Thread] = None
+    # 下载器监控里已经处理过的 hash，避免重复触发
+    _seen_torrents: Dict[str, float] = {}
+    _trigger_stats: Dict[str, Any] = {}
 
     # 115 目录 CID 缓存
     _cid_cache: Dict[str, str] = {}
@@ -109,6 +125,12 @@ class U115RapidUpload(_PluginBase):
             self._real_upload = bool(config.get("real_upload", False))
             self._notify = bool(config.get("notify", True))
             self._notify_hold = bool(config.get("notify_hold", True))
+            self._trigger_watch = bool(config.get("trigger_watch", True))
+            self._watch_settle_sec = self._to_int(
+                config.get("watch_settle_sec"), 60, 5, 3600
+            )
+            self._trigger_downloader = bool(config.get("trigger_downloader", True))
+            self._daily_time = self._normalize_daily_time(config.get("daily_time"))
         # 载入历史状态
         try:
             data = self.get_data("state")
@@ -119,11 +141,16 @@ class U115RapidUpload(_PluginBase):
         if self._enabled:
             logger.info(
                 f"【115秒传】已启用：监控 {self._watch_dir or '(未设置)'} -> "
-                f"115 {self._target_dir}，间隔 {self._interval_min} 分钟"
+                f"115 {self._target_dir}，巡逻间隔 {self._interval_min} 分钟，"
+                f"目录监控={'开' if self._trigger_watch else '关'}，"
+                f"下载器监控={'开' if self._trigger_downloader else '关'}，"
+                f"每日定时={self._daily_time or '关'}"
             )
+            self._start_watcher()
 
     def stop_service(self):
         self._pending_tasks = []
+        self._stop_watcher()
         self._save_state()
 
     def get_state(self) -> bool:
@@ -134,21 +161,256 @@ class U115RapidUpload(_PluginBase):
     def get_service(self) -> List[Dict[str, Any]]:
         if not self._enabled:
             return []
-        return [
+        services: List[Dict[str, Any]] = [
             {
                 "id": "U115RapidUpload",
-                "name": "115秒传监控",
+                "name": "115秒传·巡逻扫描",
                 "trigger": "interval",
                 "func": self.check_once,
                 "kwargs": {"minutes": max(1, int(self._interval_min or 30))},
             }
         ]
+        # 目录监控 / 下载器监控：每分钟把事件攒起来的文件推进处理
+        if self._trigger_watch or self._trigger_downloader:
+            services.append(
+                {
+                    "id": "U115RapidTrigger",
+                    "name": "115秒传·文件与下载器监控",
+                    "trigger": "interval",
+                    "func": self.monitor_tick,
+                    "kwargs": {"seconds": 60},
+                }
+            )
+        # 每天固定时间全量巡逻（忽略"每天只验证一次"的限制）
+        hour, minute = self._parse_daily_time()
+        if hour is not None:
+            services.append(
+                {
+                    "id": "U115RapidDaily",
+                    "name": f"115秒传·每日巡逻 {self._daily_time}",
+                    "trigger": "cron",
+                    "func": self.daily_patrol,
+                    "kwargs": {"hour": hour, "minute": minute},
+                }
+            )
+        return services
+
+    # ================================================================ 触发源
+
+    def daily_patrol(self, **kwargs) -> None:
+        """
+        每日固定时间全量巡逻：所有拦截中的文件都重新验证一次
+        """
+        logger.info("【115秒传】每日定时巡逻开始")
+        self.check_once(force=True)
+
+    def monitor_tick(self, **kwargs) -> None:
+        """
+        每分钟执行：处理目录监控攒下的文件事件 + 检查下载器已完成任务
+        """
+        if not self._enabled:
+            return
+        triggered: List[Path] = []
+        try:
+            triggered.extend(self._consume_fs_events())
+        except Exception as err:
+            logger.error(f"【115秒传】处理目录事件失败：{err}")
+        if self._trigger_downloader:
+            try:
+                triggered.extend(self._downloader_completed_paths())
+            except Exception as err:
+                logger.debug(f"【115秒传】检查下载器任务失败：{err}")
+        if not triggered:
+            return
+        # 去重后立刻处理，且跳过"稳定期"检查（下载器/事件已经说明写完了）
+        unique: List[Path] = []
+        seen = set()
+        for path in triggered:
+            key = path.as_posix()
+            if key in seen or not path.exists() or not path.is_file():
+                continue
+            seen.add(key)
+            unique.append(path)
+        if unique:
+            logger.info(f"【115秒传】监控触发：{len(unique)} 个文件立即处理")
+            self._trigger_stats["last_trigger_at"] = time.strftime("%m-%d %H:%M:%S")
+            self._trigger_stats["last_trigger_count"] = len(unique)
+            self.check_once(paths=unique, force_stable=True)
+
+    def _start_watcher(self) -> None:
+        """
+        目录监控：用 watchfiles 监听监控目录，只记录变化，真正的处理交给 monitor_tick
+        """
+        if not self._trigger_watch or not self._watch_dir:
+            return
+        try:
+            import watchfiles  # noqa: F401
+        except Exception as err:
+            logger.warn(f"【115秒传】当前环境没有 watchfiles，目录监控退化为巡逻扫描：{err}")
+            self._trigger_watch = False
+            return
+        if self._watch_thread and self._watch_thread.is_alive():
+            return
+        watch_path = Path(self._watch_dir)
+        if not watch_path.exists():
+            logger.warn(f"【115秒传】监控目录不存在，目录监控未启动：{watch_path}")
+            return
+        self._stop_watch = threading.Event()
+
+        def _loop():
+            from watchfiles import watch
+
+            try:
+                for changes in watch(
+                    str(watch_path),
+                    stop_event=self._stop_watch,
+                    recursive=self._recursive,
+                    debounce=2000,
+                    step=500,
+                ):
+                    if self._stop_watch.is_set():
+                        break
+                    now = time.time()
+                    for _change, raw in changes:
+                        self._fs_pending[str(raw)] = now
+            except Exception as err:
+                logger.error(f"【115秒传】目录监控线程退出：{err}")
+
+        self._watch_thread = threading.Thread(
+            target=_loop, name="U115RapidWatcher", daemon=True
+        )
+        self._watch_thread.start()
+        logger.info(f"【115秒传】目录监控已启动：{watch_path}（递归={self._recursive}）")
+
+    def _stop_watcher(self) -> None:
+        try:
+            if self._stop_watch:
+                self._stop_watch.set()
+        except Exception:
+            pass
+        self._watch_thread = None
+        self._fs_pending = {}
+
+    def _consume_fs_events(self) -> List[Path]:
+        """
+        取出静置超过 watch_settle_sec 的文件事件，返回可以处理的文件
+        """
+        if not self._fs_pending:
+            return []
+        now = time.time()
+        settle = max(5, int(self._watch_settle_sec or 60))
+        ready: List[Path] = []
+        remain: Dict[str, float] = {}
+        for raw, stamp in list(self._fs_pending.items()):
+            path = Path(raw)
+            # 目录变化时，把目录里的文件也带上（下载工具通常先建目录再写文件）
+            if path.is_dir():
+                if now - float(stamp) < settle:
+                    remain[raw] = stamp
+                    continue
+                try:
+                    for child in path.rglob("*") if self._recursive else path.glob("*"):
+                        if child.is_file():
+                            ready.append(child)
+                except Exception:
+                    pass
+                continue
+            if not path.exists():
+                continue
+            if now - float(stamp) < settle:
+                remain[raw] = stamp
+                continue
+            ready.append(path)
+        self._fs_pending = remain
+        return ready
+
+    def _downloader_completed_paths(self) -> List[Path]:
+        """
+        下载器监控：查 MoviePilot 里各下载器"已完成"的任务，
+        任务保存路径落在监控目录内的，立刻把对应文件交给秒传验证。
+        """
+        try:
+            from app.core.module import ModuleManager
+            from app.schemas.types import ModuleType
+        except Exception as err:
+            logger.debug(f"【115秒传】无法加载下载器模块接口：{err}")
+            return []
+
+        watch_root = Path(self._watch_dir) if self._watch_dir else None
+        if not watch_root:
+            return []
+
+        result: List[Path] = []
+        try:
+            modules = list(
+                ModuleManager().get_running_type_modules(ModuleType.Downloader)
+            )
+        except Exception as err:
+            logger.debug(f"【115秒传】获取下载器列表失败：{err}")
+            return []
+
+        for module in modules:
+            getter = getattr(module, "get_completed_torrents", None)
+            if not getter:
+                continue
+            try:
+                torrents = getter() or []
+            except Exception as err:
+                logger.debug(f"【115秒传】查询下载器已完成任务失败：{err}")
+                continue
+            for torrent in torrents:
+                try:
+                    torrent_hash = str(getattr(torrent, "hash", "") or "")
+                    if torrent_hash and self._seen_torrents.get(torrent_hash):
+                        continue
+                    save_path = getattr(torrent, "path", None)
+                    if not save_path:
+                        continue
+                    save_path = Path(save_path)
+                    if not save_path.exists():
+                        continue
+                    try:
+                        if not save_path.is_relative_to(watch_root):
+                            continue
+                    except AttributeError:
+                        # Python 3.8 兼容
+                        if watch_root.as_posix() not in save_path.as_posix():
+                            continue
+                    if torrent_hash:
+                        self._seen_torrents[torrent_hash] = time.time()
+                    if save_path.is_file():
+                        result.append(save_path)
+                    else:
+                        for child in save_path.rglob("*") if self._recursive else save_path.glob("*"):
+                            if child.is_file():
+                                result.append(child)
+                    logger.info(
+                        f"【115秒传】下载器任务已完成：{getattr(torrent, 'title', None) or save_path.name}"
+                    )
+                except Exception:
+                    continue
+        # 清理过期的 hash 记录
+        if len(self._seen_torrents) > 500:
+            cutoff = time.time() - 7 * 24 * 3600
+            self._seen_torrents = {
+                k: v for k, v in self._seen_torrents.items() if v > cutoff
+            }
+        return result
 
     # ================================================================ 主流程
 
-    def check_once(self, force: bool = False, **kwargs) -> None:
+    def check_once(
+        self,
+        force: bool = False,
+        paths: Optional[List[Path]] = None,
+        force_stable: bool = False,
+        **kwargs,
+    ) -> None:
         """
-        扫描一轮。force=True 时忽略"每天只验证一次"的限制（手动触发用）。
+        扫描一轮。
+        :param force: 忽略"每天只验证一次"的限制（手动触发/每日巡逻用）
+        :param paths: 只处理指定文件（目录监控/下载器监控触发时传入）
+        :param force_stable: 跳过"文件稳定"检查（已由事件确认写完）
         """
         if not self._enabled and not force:
             return
@@ -180,7 +442,11 @@ class U115RapidUpload(_PluginBase):
                 self._finish(run_result)
                 return
 
-            candidates = self._list_candidates(watch)
+            if paths:
+                candidates = [p for p in paths if self._accept(p)]
+                logger.info(f"【115秒传】监控触发处理 {len(candidates)} 个文件")
+            else:
+                candidates = self._list_candidates(watch)
             if not candidates:
                 logger.debug("【115秒传】本轮没有待处理文件")
                 self._finish(run_result)
@@ -188,7 +454,7 @@ class U115RapidUpload(_PluginBase):
 
             for path in candidates:
                 try:
-                    item = self._process_file(storage, cid, path, force)
+                    item = self._process_file(storage, cid, path, force, force_stable)
                 except Exception as err:
                     logger.error(f"【115秒传】处理 {path.name} 出错：{err}")
                     item = {"file": path.name, "status": "error", "note": str(err)}
@@ -209,7 +475,14 @@ class U115RapidUpload(_PluginBase):
             )
             self._notify_result(run_result)
 
-    def _process_file(self, storage, cid: str, path: Path, force: bool = False) -> Optional[dict]:
+    def _process_file(
+        self,
+        storage,
+        cid: str,
+        path: Path,
+        force: bool = False,
+        force_stable: bool = False,
+    ) -> Optional[dict]:
         """
         处理单个文件，返回结果字典
         """
@@ -231,8 +504,8 @@ class U115RapidUpload(_PluginBase):
         if record.get("status") == "done":
             return None
 
-        # 文件可能还在写入
-        if not force and self._stable_minutes > 0:
+        # 文件可能还在写入（监控事件已确认写完时可跳过）
+        if not force and not force_stable and self._stable_minutes > 0:
             if time.time() - mtime < self._stable_minutes * 60:
                 logger.debug(f"【115秒传】{path.name} 刚变更，等它稳定后再处理")
                 return None
@@ -528,24 +801,35 @@ class U115RapidUpload(_PluginBase):
         except Exception as err:
             logger.error(f"【115秒传】遍历目录失败：{err}")
             return []
-        allowed = self._ext_set()
-        min_size = max(0, int(self._min_size_mb or 0)) * 1024 * 1024
         result: List[Path] = []
         for path in iterator:
             try:
-                if not path.is_file():
-                    continue
-                if path.name.startswith("."):
-                    continue
-                if allowed and path.suffix.lower().lstrip(".") not in allowed:
-                    continue
-                if path.stat().st_size < min_size:
-                    continue
-                result.append(path)
+                if self._accept(path):
+                    result.append(path)
             except Exception:
                 continue
         result.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0)
         return result
+
+    def _accept(self, path: Path) -> bool:
+        """
+        单个文件是否符合处理条件（扩展名/体积/隐藏文件）
+        """
+        try:
+            path = Path(path)
+            if not path.is_file():
+                return False
+            if path.name.startswith("."):
+                return False
+            allowed = self._ext_set()
+            if allowed and path.suffix.lower().lstrip(".") not in allowed:
+                return False
+            min_size = max(0, int(self._min_size_mb or 0)) * 1024 * 1024
+            if path.stat().st_size < min_size:
+                return False
+            return True
+        except Exception:
+            return False
 
     def _file_key(self, path: Path) -> str:
         try:
@@ -655,6 +939,35 @@ class U115RapidUpload(_PluginBase):
             return default
 
     @staticmethod
+    def _normalize_daily_time(value: Any) -> str:
+        """
+        把「07:30」「7:30」「0730」统一成 HH:MM，非法返回空串（=关闭）
+        """
+        raw = str(value or "").strip().replace("：", ":")
+        if not raw:
+            return ""
+        try:
+            if ":" in raw:
+                parts = raw.split(":")
+                hour, minute = int(parts[0]), int(parts[1])
+            elif len(raw) in (3, 4) and raw.isdigit():
+                hour, minute = int(raw[:-2]), int(raw[-2:])
+            else:
+                return ""
+        except Exception:
+            return ""
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            return ""
+        return f"{hour:02d}:{minute:02d}"
+
+    def _parse_daily_time(self) -> Tuple[Optional[int], Optional[int]]:
+        raw = self._normalize_daily_time(self._daily_time)
+        if not raw:
+            return None, None
+        hour, minute = raw.split(":")
+        return int(hour), int(minute)
+
+    @staticmethod
     def _fmt_size(size: int) -> str:
         try:
             value = float(size)
@@ -734,6 +1047,13 @@ class U115RapidUpload(_PluginBase):
             "retry_hours": self._retry_hours,
             "delete_source": self._delete_source,
             "real_upload": self._real_upload,
+            "trigger_watch": self._trigger_watch,
+            "watch_settle_sec": self._watch_settle_sec,
+            "trigger_downloader": self._trigger_downloader,
+            "daily_time": self._daily_time,
+            "watch_thread_alive": bool(self._watch_thread and self._watch_thread.is_alive()),
+            "fs_pending": len(self._fs_pending),
+            "trigger_stats": self._trigger_stats,
             "u115_authorized": storage_ok,
             "u115_error": auth_error,
             "last_run_at": time.strftime(
@@ -953,6 +1273,92 @@ class U115RapidUpload(_PluginBase):
                                         "props": {
                                             "type": "info",
                                             "variant": "tonal",
+                                            "text": "触发方式：下面三种可以同时开，任意一种命中都会立即处理文件。",
+                                        },
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "trigger_watch",
+                                            "label": "目录监控（实时文件事件）",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "trigger_downloader",
+                                            "label": "下载器监控（下载完成即触发）",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "daily_time",
+                                            "label": "每天定时巡逻（HH:MM）",
+                                            "placeholder": "07:30",
+                                            "hint": "留空关闭；到点会把所有拦截中的文件重新验证一遍",
+                                            "clearable": True,
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "watch_settle_sec",
+                                            "label": "文件写入静置（秒）",
+                                            "type": "number",
+                                            "hint": "目录监控最后一次变化后静置多久才处理",
+                                        },
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "VAlert",
+                                        "props": {
+                                            "type": "info",
+                                            "variant": "tonal",
                                             "text": (
                                                 "本插件直接复用 MoviePilot 里已授权的「115网盘」存储"
                                                 "（设置 → 存储 → 115网盘，OpenAPI 或扫码都行），"
@@ -983,6 +1389,10 @@ class U115RapidUpload(_PluginBase):
             "real_upload": False,
             "notify": True,
             "notify_hold": True,
+            "trigger_watch": True,
+            "watch_settle_sec": 60,
+            "trigger_downloader": True,
+            "daily_time": "",
         }
 
     def get_page(self) -> List[dict]:

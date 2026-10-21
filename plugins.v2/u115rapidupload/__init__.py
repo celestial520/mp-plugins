@@ -16,6 +16,7 @@
 """
 
 import hashlib
+import os
 import threading
 import time
 from pathlib import Path
@@ -44,7 +45,7 @@ class U115RapidUpload(_PluginBase):
     plugin_name = "115秒传搬运"
     plugin_desc = "监控本地目录（支持下载器监控/目录实时监控/定时巡逻三种触发），能秒传就传 115、通知并删除源文件；不能秒传先拦截，之后每天再验证"
     plugin_icon = ""
-    plugin_version = "1.1"
+    plugin_version = "1.2"
     plugin_author = "celestial520"
     author_url = "https://github.com/celestial520/mp-plugins"
     plugin_config_prefix = "u115rapid_"
@@ -63,8 +64,8 @@ class U115RapidUpload(_PluginBase):
     _interval_min: int = 30
     # 文件大小/修改时间需要稳定多少分钟才认为"下载完成"
     _stable_minutes: int = 5
-    # 秒传失败后，隔多少小时再验证一次（默认 24 = 第二天）
-    _retry_hours: int = 24
+    # 秒传失败后，在"第二天"的哪个时刻再验证（HH:MM）
+    _retry_time: str = "09:00"
     # 体积下限（MB），小于该值跳过
     _min_size_mb: int = 100
     # 扩展名白名单（逗号分隔，留空表示不限）
@@ -83,8 +84,10 @@ class U115RapidUpload(_PluginBase):
     _watch_settle_sec: int = 60
     # 下载器监控：查 MP 下载器里已完成的任务，命中监控目录就立刻触发
     _trigger_downloader: bool = True
-    # 每日定时巡逻（HH:MM，留空关闭）
-    _daily_time: str = ""
+    # 每天定时清理监控目录下的空文件夹（不删监控目录本身）
+    _cleanup_enabled: bool = True
+    # 清理空文件夹的时刻（HH:MM）
+    _cleanup_time: str = "03:30"
 
     # ---------------------------------------------------------------- 运行时
     _state: Dict[str, dict] = {}
@@ -118,7 +121,7 @@ class U115RapidUpload(_PluginBase):
             self._recursive = bool(config.get("recursive", True))
             self._interval_min = self._to_int(config.get("interval_min"), 30, 1, 1440)
             self._stable_minutes = self._to_int(config.get("stable_minutes"), 5, 0, 1440)
-            self._retry_hours = self._to_int(config.get("retry_hours"), 24, 1, 24 * 30)
+            self._retry_time = self._normalize_daily_time(config.get("retry_time")) or "09:00"
             self._min_size_mb = self._to_int(config.get("min_size_mb"), 100, 0, 1024 * 1024)
             self._ext_filter = str(config.get("ext_filter") or "").strip()
             self._delete_source = bool(config.get("delete_source", True))
@@ -130,7 +133,8 @@ class U115RapidUpload(_PluginBase):
                 config.get("watch_settle_sec"), 60, 5, 3600
             )
             self._trigger_downloader = bool(config.get("trigger_downloader", True))
-            self._daily_time = self._normalize_daily_time(config.get("daily_time"))
+            self._cleanup_enabled = bool(config.get("cleanup_enabled", True))
+            self._cleanup_time = self._normalize_daily_time(config.get("cleanup_time")) or "03:30"
         # 载入历史状态
         try:
             data = self.get_data("state")
@@ -144,7 +148,8 @@ class U115RapidUpload(_PluginBase):
                 f"115 {self._target_dir}，巡逻间隔 {self._interval_min} 分钟，"
                 f"目录监控={'开' if self._trigger_watch else '关'}，"
                 f"下载器监控={'开' if self._trigger_downloader else '关'}，"
-                f"每日定时={self._daily_time or '关'}"
+                f"每日重试={self._retry_time}，"
+                f"空目录清理={'每天 ' + self._cleanup_time if self._cleanup_enabled else '关'}"
             )
             self._start_watcher()
 
@@ -181,16 +186,28 @@ class U115RapidUpload(_PluginBase):
                     "kwargs": {"seconds": 60},
                 }
             )
-        # 每天固定时间全量巡逻（忽略"每天只验证一次"的限制）
-        hour, minute = self._parse_daily_time()
+        # 每天到点重试验证（把昨天拦截的文件再验一遍）
+        hour, minute = self._parse_time(self._retry_time)
         if hour is not None:
             services.append(
                 {
-                    "id": "U115RapidDaily",
-                    "name": f"115秒传·每日巡逻 {self._daily_time}",
+                    "id": "U115RapidRetry",
+                    "name": f"115秒传·每日重试 {self._retry_time}",
                     "trigger": "cron",
                     "func": self.daily_patrol,
                     "kwargs": {"hour": hour, "minute": minute},
+                }
+            )
+        # 每天到点清理监控目录下的空文件夹
+        ch, cm = self._parse_time(self._cleanup_time)
+        if self._cleanup_enabled and ch is not None:
+            services.append(
+                {
+                    "id": "U115RapidCleanup",
+                    "name": f"115秒传·清理空目录 {self._cleanup_time}",
+                    "trigger": "cron",
+                    "func": self.cleanup_empty_dirs,
+                    "kwargs": {"hour": ch, "minute": cm},
                 }
             )
         return services
@@ -199,7 +216,7 @@ class U115RapidUpload(_PluginBase):
 
     def daily_patrol(self, **kwargs) -> None:
         """
-        每日固定时间全量巡逻：所有拦截中的文件都重新验证一次
+        每天到点跑一次：把到达重试时间的文件（含昨天拦截的）重新验证
         """
         logger.info("【115秒传】每日定时巡逻开始")
         self.check_once(force=True)
@@ -510,13 +527,16 @@ class U115RapidUpload(_PluginBase):
                 logger.debug(f"【115秒传】{path.name} 刚变更，等它稳定后再处理")
                 return None
 
-        # 每天只验证一次
+        # 不能秒传的，等到「第二天 _retry_time」再验证
         last_try = float(record.get("last_try") or 0)
         if not force and last_try:
-            gap = max(1, int(self._retry_hours or 24)) * 3600
-            if time.time() - last_try < gap:
-                left = int((gap - (time.time() - last_try)) / 60)
-                logger.debug(f"【115秒传】{path.name} 距上次验证不足，约 {left} 分钟后再试")
+            next_at = self._next_retry_ts(last_try)
+            if next_at and time.time() < next_at:
+                left = int((next_at - time.time()) / 60)
+                logger.debug(
+                    f"【115秒传】{path.name} 下次验证 "
+                    f"{time.strftime('%m-%d %H:%M', time.localtime(next_at))}（约 {left} 分钟后）"
+                )
                 return None
 
         # 网盘上已有同名文件（说明之前已经传过），直接收尾
@@ -611,8 +631,11 @@ class U115RapidUpload(_PluginBase):
 
             record["status"] = "held"
             record["note"] = detail
-            next_try = time.strftime(
-                "%m-%d %H:%M", time.localtime(time.time() + max(1, self._retry_hours) * 3600)
+            next_ts = self._next_retry_ts(record.get("last_try") or time.time())
+            next_try = (
+                time.strftime("%m-%d %H:%M", time.localtime(next_ts))
+                if next_ts
+                else "明天"
             )
             logger.info(f"【115秒传】{name} 暂不能秒传，已拦截，{next_try} 后再验证")
             return {
@@ -778,6 +801,62 @@ class U115RapidUpload(_PluginBase):
         except Exception as err:
             logger.error(f"【115秒传】真实上传异常：{err}")
             return False
+
+    def cleanup_empty_dirs(self, **kwargs) -> None:
+        """
+        每天定时清理：删除监控目录下已经空了的子文件夹。
+        注意：监控目录本身（watch_dir）永远不会被删除。
+        """
+        if not self._cleanup_enabled:
+            return
+        root = Path(self._watch_dir) if self._watch_dir else None
+        if not root or not root.exists() or not root.is_dir():
+            return
+        removed: List[str] = []
+        try:
+            for current, dirs, files in os.walk(root, topdown=False):
+                cur = Path(current)
+                if cur == root:
+                    # 监控目录本身必须保留
+                    continue
+                try:
+                    if any(cur.iterdir()):
+                        continue
+                    cur.rmdir()
+                    removed.append(cur.relative_to(root).as_posix())
+                    logger.info(f"【115秒传】清理空目录：{cur}")
+                except OSError:
+                    continue
+        except Exception as err:
+            logger.error(f"【115秒传】清理空目录出错：{err}")
+        if removed:
+            self._trigger_stats["last_cleanup_at"] = time.strftime("%m-%d %H:%M:%S")
+            self._trigger_stats["last_cleanup_count"] = len(removed)
+            if self._notify:
+                try:
+                    self.post_message(
+                        mtype=NotificationType.Plugin,
+                        title=f"115秒传：清理了 {len(removed)} 个空文件夹",
+                        text="\n".join(removed[:15]),
+                    )
+                except Exception as err:
+                    logger.error(f"【115秒传】发送清理通知失败：{err}")
+
+    def action_run_now(self, **kwargs) -> None:
+        """
+        插件动作：立即运行一次（忽略重试时间限制，全部重新验证一遍）
+        """
+        logger.info("【115秒传】手动触发：立即运行一次")
+        self.check_once(force=True)
+
+    def get_actions(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "id": "run_now",
+                "name": "立即运行一次",
+                "func": self.action_run_now,
+            }
+        ]
 
     def _delete_local(self, path: Path) -> bool:
         """
@@ -960,12 +1039,29 @@ class U115RapidUpload(_PluginBase):
             return ""
         return f"{hour:02d}:{minute:02d}"
 
-    def _parse_daily_time(self) -> Tuple[Optional[int], Optional[int]]:
-        raw = self._normalize_daily_time(self._daily_time)
+    def _parse_time(self, value: Any) -> Tuple[Optional[int], Optional[int]]:
+        raw = self._normalize_daily_time(value)
         if not raw:
             return None, None
         hour, minute = raw.split(":")
         return int(hour), int(minute)
+
+    def _next_retry_ts(self, last_try: float) -> Optional[float]:
+        """
+        「第二天 _retry_time」对应的时间戳：
+        以 last_try 当天为基准往后一天，取那天的 HH:MM。
+        """
+        hour, minute = self._parse_time(self._retry_time)
+        if hour is None:
+            return None
+        try:
+            base = time.localtime(float(last_try or time.time()))
+            day = time.mktime(
+                (base.tm_year, base.tm_mon, base.tm_mday, 0, 0, 0, 0, 0, -1)
+            )
+            return day + 24 * 3600 + hour * 3600 + minute * 60
+        except Exception:
+            return None
 
     @staticmethod
     def _fmt_size(size: int) -> str:
@@ -1044,13 +1140,14 @@ class U115RapidUpload(_PluginBase):
             "watch_dir": self._watch_dir,
             "target_dir": self._target_dir,
             "interval_min": self._interval_min,
-            "retry_hours": self._retry_hours,
+            "retry_time": self._retry_time,
             "delete_source": self._delete_source,
             "real_upload": self._real_upload,
             "trigger_watch": self._trigger_watch,
             "watch_settle_sec": self._watch_settle_sec,
             "trigger_downloader": self._trigger_downloader,
-            "daily_time": self._daily_time,
+            "cleanup_enabled": self._cleanup_enabled,
+            "cleanup_time": self._cleanup_time,
             "watch_thread_alive": bool(self._watch_thread and self._watch_thread.is_alive()),
             "fs_pending": len(self._fs_pending),
             "trigger_stats": self._trigger_stats,
@@ -1071,6 +1168,71 @@ class U115RapidUpload(_PluginBase):
         return {"success": True}
 
     # ================================================================ 表单/页面
+
+    # ================================================================ 路径候选
+
+    def _local_dir_items(self) -> List[str]:
+        """
+        给「本地监控目录」下拉框准备候选路径（MP 的 JSON 表单没有文件夹浏览器，
+        所以做成"下拉可选 + 也可以手填"）
+        """
+        items: List[str] = []
+        current = (self._watch_dir or "").strip()
+        if current:
+            items.append(current)
+        bases = ["/media", "/downloads", "/video", "/mnt", "/config", "/"]
+        for base in bases:
+            try:
+                base_path = Path(base)
+                if not base_path.exists() or not base_path.is_dir():
+                    continue
+                if base not in items:
+                    items.append(base)
+                sub_dirs = [c for c in sorted(base_path.iterdir()) if c.is_dir()][:20]
+                for sub in sub_dirs:
+                    text = sub.as_posix()
+                    if text in items:
+                        continue
+                    items.append(text)
+                    try:
+                        for grand in [c for c in sorted(sub.iterdir()) if c.is_dir()][:10]:
+                            gtext = grand.as_posix()
+                            if gtext not in items:
+                                items.append(gtext)
+                    except Exception:
+                        pass
+            except Exception:
+                continue
+        return items[:150]
+
+    def _115_dir_items(self) -> List[str]:
+        """
+        给「115 目标目录」下拉框准备候选（列出网盘根目录下的一级文件夹）
+        """
+        cached = self._trigger_stats.get("_115_items")
+        if cached and time.time() - float(cached[1]) < 600:
+            return list(cached[0])
+        items: List[str] = []
+        current = (self._target_dir or "/").strip() or "/"
+        items.append(current)
+        items.append("/")
+        try:
+            if U115Pan:
+                storage = U115Pan()
+                if storage.check():
+                    root = type(
+                        "RootItem", (), {"path": "/", "type": "dir", "fileid": "0"}
+                    )()
+                    for folder in storage.list(root) or []:
+                        if getattr(folder, "type", "") == "dir":
+                            path_text = getattr(folder, "path", None)
+                            if path_text:
+                                items.append(str(path_text).rstrip("/") or "/")
+        except Exception as err:
+            logger.debug(f"【115秒传】获取 115 目录列表失败：{err}")
+        items = list(dict.fromkeys(items))
+        self._trigger_stats["_115_items"] = (items, time.time())
+        return items[:100]
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         return [
@@ -1126,12 +1288,14 @@ class U115RapidUpload(_PluginBase):
                                 "props": {"cols": 12, "md": 6},
                                 "content": [
                                     {
-                                        "component": "VTextField",
+                                        "component": "VAutocomplete",
                                         "props": {
                                             "model": "watch_dir",
                                             "label": "本地监控目录",
-                                            "placeholder": "/downloads/115staging",
-                                            "hint": "容器内路径，文件落进来就会被检测",
+                                            "items": self._local_dir_items(),
+                                            "placeholder": "点右侧箭头选择，或直接输入容器内路径",
+                                            "hint": "要监控哪个文件夹。点开下拉可看到常用目录，也可以手动输入",
+                                            "clearable": True,
                                         },
                                     }
                                 ],
@@ -1141,12 +1305,14 @@ class U115RapidUpload(_PluginBase):
                                 "props": {"cols": 12, "md": 6},
                                 "content": [
                                     {
-                                        "component": "VTextField",
+                                        "component": "VAutocomplete",
                                         "props": {
                                             "model": "target_dir",
                                             "label": "115 目标目录",
-                                            "placeholder": "/电影",
-                                            "hint": "网盘路径，不存在会自动创建；根目录填 /",
+                                            "items": self._115_dir_items(),
+                                            "placeholder": "点右侧箭头选择网盘目录，或直接输入",
+                                            "hint": "网盘里的路径，不存在会自动创建；根目录填 /",
+                                            "clearable": True,
                                         },
                                     }
                                 ],
@@ -1177,25 +1343,10 @@ class U115RapidUpload(_PluginBase):
                                     {
                                         "component": "VTextField",
                                         "props": {
-                                            "model": "retry_hours",
-                                            "label": "秒传失败后重试（小时）",
-                                            "type": "number",
-                                            "hint": "24 = 第二天再验证",
-                                        },
-                                    }
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 3},
-                                "content": [
-                                    {
-                                        "component": "VTextField",
-                                        "props": {
                                             "model": "stable_minutes",
                                             "label": "文件稳定（分钟）",
                                             "type": "number",
-                                            "hint": "避免处理还在下载的文件",
+                                            "hint": "只有巡逻扫描会等，监控触发不等",
                                         },
                                     }
                                 ],
@@ -1214,14 +1365,9 @@ class U115RapidUpload(_PluginBase):
                                     }
                                 ],
                             },
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12},
+                                "props": {"cols": 12, "md": 3},
                                 "content": [
                                     {
                                         "component": "VTextField",
@@ -1229,35 +1375,10 @@ class U115RapidUpload(_PluginBase):
                                             "model": "ext_filter",
                                             "label": "扩展名白名单",
                                             "placeholder": "mkv,mp4,ts,iso",
-                                            "hint": "逗号分隔，留空表示不限制",
+                                            "hint": "逗号分隔，留空不限",
                                         },
                                     }
                                 ],
-                            }
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 6},
-                                "content": [
-                                    {
-                                        "component": "VSwitch",
-                                        "props": {"model": "recursive", "label": "递归扫描子目录"},
-                                    }
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 6},
-                                "content": [
-                                    {
-                                        "component": "VSwitch",
-                                        "props": {"model": "notify", "label": "发送微信通知"},
-                                    }
-                                ],
                             },
                         ],
                     },
@@ -1266,18 +1387,47 @@ class U115RapidUpload(_PluginBase):
                         "content": [
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12},
+                                "props": {"cols": 12, "md": 4},
                                 "content": [
                                     {
-                                        "component": "VAlert",
+                                        "component": "VTextField",
                                         "props": {
-                                            "type": "info",
-                                            "variant": "tonal",
-                                            "text": "触发方式：下面三种可以同时开，任意一种命中都会立即处理文件。",
+                                            "model": "retry_time",
+                                            "label": "不能秒传时，第二天几点再检测",
+                                            "type": "time",
+                                            "hint": "点右侧时钟图标选择时间",
                                         },
                                     }
                                 ],
-                            }
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "cleanup_enabled",
+                                            "label": "每天清理空文件夹",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "cleanup_time",
+                                            "label": "每天几点清理空文件夹",
+                                            "type": "time",
+                                            "hint": "只删空子目录，监控目录本身永远保留",
+                                        },
+                                    }
+                                ],
+                            },
                         ],
                     },
                     {
@@ -1291,7 +1441,7 @@ class U115RapidUpload(_PluginBase):
                                         "component": "VSwitch",
                                         "props": {
                                             "model": "trigger_watch",
-                                            "label": "目录监控（实时文件事件）",
+                                            "label": "目录监控（文件变化实时触发）",
                                         },
                                     }
                                 ],
@@ -1316,11 +1466,10 @@ class U115RapidUpload(_PluginBase):
                                     {
                                         "component": "VTextField",
                                         "props": {
-                                            "model": "daily_time",
-                                            "label": "每天定时巡逻（HH:MM）",
-                                            "placeholder": "07:30",
-                                            "hint": "留空关闭；到点会把所有拦截中的文件重新验证一遍",
-                                            "clearable": True,
+                                            "model": "watch_settle_sec",
+                                            "label": "文件写入静置（秒）",
+                                            "type": "number",
+                                            "hint": "最后一次变化后静置多久才处理",
                                         },
                                     }
                                 ],
@@ -1335,16 +1484,34 @@ class U115RapidUpload(_PluginBase):
                                 "props": {"cols": 12, "md": 4},
                                 "content": [
                                     {
-                                        "component": "VTextField",
+                                        "component": "VSwitch",
+                                        "props": {"model": "recursive", "label": "递归扫描子目录"},
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {"model": "notify", "label": "发送微信通知"},
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
                                         "props": {
-                                            "model": "watch_settle_sec",
-                                            "label": "文件写入静置（秒）",
-                                            "type": "number",
-                                            "hint": "目录监控最后一次变化后静置多久才处理",
+                                            "model": "notify_hold",
+                                            "label": "文件被拦截时也通知",
                                         },
                                     }
                                 ],
-                            }
+                            },
                         ],
                     },
                     {
@@ -1360,12 +1527,11 @@ class U115RapidUpload(_PluginBase):
                                             "type": "info",
                                             "variant": "tonal",
                                             "text": (
-                                                "本插件直接复用 MoviePilot 里已授权的「115网盘」存储"
-                                                "（设置 → 存储 → 115网盘，OpenAPI 或扫码都行），"
-                                                "不额外保存任何账号信息。"
-                                                "流程：文件稳定后计算 SHA1 → 调用 115 秒传接口验证 → "
-                                                "能秒传则创建网盘文件、发通知、删除源文件；"
-                                                "不能秒传则原样保留，按设定的小时数后再验证一次。"
+                                                "工作流程：发现监控目录里白名单文件 → 计算特征值 → 调 115 秒传接口验证。"
+                                                "能秒传：创建网盘文件、发通知、删除源文件（空文件夹留到每天定时清理）。"
+                                                "不能秒传：原样保留，等到「第二天设定的时间」再验证。"
+                                                "触发方式三种可同时开：下载器监控 / 目录监控 / 巡逻扫描。"
+                                                "想马上跑一次，用插件卡片菜单里的「立即运行一次」。"
                                             ),
                                         },
                                     }
@@ -1382,17 +1548,18 @@ class U115RapidUpload(_PluginBase):
             "recursive": True,
             "interval_min": 30,
             "stable_minutes": 5,
-            "retry_hours": 24,
+            "retry_time": "09:00",
             "min_size_mb": 100,
             "ext_filter": "mkv,mp4,ts,iso,m2ts,avi,rmvb,flac,ape,wav",
             "delete_source": True,
             "real_upload": False,
+            "cleanup_enabled": True,
+            "cleanup_time": "03:30",
             "notify": True,
             "notify_hold": True,
             "trigger_watch": True,
             "watch_settle_sec": 60,
             "trigger_downloader": True,
-            "daily_time": "",
         }
 
     def get_page(self) -> List[dict]:

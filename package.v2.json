@@ -34,5 +34,18 @@
     },
     "author_url": "https://github.com/celestial520/mp-plugins",
     "repo_url": "https://github.com/celestial520/mp-plugins"
+  },
+  "U115TransferNotify": {
+    "name": "115秒传助手·整理通知",
+    "description": "MoviePilot 整理完成后，把整理出来的文件路径直接推给「115秒传助手」，让它立刻尝试秒传，不用等助手自己的每日扫描。因为整理会把文件从下载目录搬到媒体库，所以推的是整理后的真实路径；支持路径映射（MP 容器路径 → 助手容器路径）、可选包含字幕/音轨事件、可按需在 MP 里再发一条通知。",
+    "labels": "网盘",
+    "version": "1.0",
+    "author": "celestial520",
+    "author_url": "https://github.com/celestial520/mp-plugins",
+    "repo_url": "https://github.com/celestial520/mp-plugins",
+    "level": 1,
+    "history": {
+      "v1.0": "监听 TransferComplete / SubtitleTransferComplete / AudioTransferComplete 事件，取 transferinfo.file_list_new（或 target_item）里的目标路径，做路径映射后 POST 到助手的 /api/trigger（X-API-Key 鉴权）；60 秒内相同批次去重；目标是网盘存储的整理结果自动跳过"
+    }
   }
 }

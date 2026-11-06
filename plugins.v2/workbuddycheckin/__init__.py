@@ -117,6 +117,32 @@ class WorkBuddyCheckin(_PluginBase):
                             ]},
                         ]
                     },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
+                                {"component": "VBtn",
+                                 "props": {"color": "primary", "variant": "tonal", "size": "small",
+                                           "prependIcon": "mdi-play-circle-outline"},
+                                 "text": "立即运行一次",
+                                 "api": "plugin/WorkBuddyCheckin/check"}
+                            ]},
+                            {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
+                                {"component": "VBtn",
+                                 "props": {"color": "info", "variant": "tonal", "size": "small",
+                                           "prependIcon": "mdi-bell-outline"},
+                                 "text": "发送测试通知",
+                                 "api": "plugin/WorkBuddyCheckin/test-notify"}
+                            ]},
+                            {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
+                                {"component": "VBtn",
+                                 "props": {"color": "secondary", "variant": "tonal", "size": "small",
+                                           "prependIcon": "mdi-format-list-checks"},
+                                 "text": "查看状态",
+                                 "api": "plugin/WorkBuddyCheckin/status"}
+                            ]},
+                        ]
+                    },
                 ]
             }
         ], {

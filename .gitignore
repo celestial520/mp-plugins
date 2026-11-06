@@ -8,3 +8,6 @@ Thumbs.db
 
 # 令牌导出工具生成的凭据目录（等同账号钥匙，绝对不要提交）
 /data/
+
+# 本地备份（插件仓库列表）
+.plugin_market_backup.txt

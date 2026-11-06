@@ -48,5 +48,31 @@
       "v1.0": "监听 TransferComplete / SubtitleTransferComplete / AudioTransferComplete 事件，取 transferinfo.file_list_new（或 target_item）里的目标路径，做路径映射后 POST 到助手的 /api/trigger（X-API-Key 鉴权）；60 秒内相同批次去重；目标是网盘存储的整理结果自动跳过",
       "v1.1": "默认改为推送「整理后的文件夹」（transferinfo.target_diritem），助手会递归处理整批文件；新增「推送什么给助手」选项（文件夹 / 文件清单）；路径映射改为可选项并更新说明"
     }
+  },
+  "P115InstantTransfer": {
+    "name": "115秒传监控",
+    "description": "监控文件夹验证115网盘秒传：能秒传则秒传后移入回收目录并微信通知，不能则拦截并次日重试。",
+    "labels": "115,网盘,自动化,秒传",
+    "version": "1.0.0",
+    "author": "celestial520",
+    "level": 1,
+    "history": {
+      "v1.0.0": "初始版本：监控文件夹验证115网盘秒传，成功后移入回收目录并微信通知，不能则次日重试；已合并进 mp-plugins 插件合集"
+    },
+    "author_url": "https://github.com/celestial520/mp-plugins",
+    "repo_url": "https://github.com/celestial520/mp-plugins"
+  },
+  "WorkBuddyCheckin": {
+    "name": "WorkBuddy每日签到",
+    "description": "每天自动领 WorkBuddy 每日礼包积分：长效令牌自续期、断签补签、签到成功走 MP 内置企业微信通知。",
+    "labels": "WorkBuddy,积分,签到,自动化,通知",
+    "version": "1.0.0",
+    "author": "celestial520",
+    "level": 1,
+    "history": {
+      "v1.0.0": "初始版本：每日自动签到，令牌轮换回写插件数据，复用 MP 内置通知渠道；已合并进 mp-plugins 插件合集"
+    },
+    "author_url": "https://github.com/celestial520/mp-plugins",
+    "repo_url": "https://github.com/celestial520/mp-plugins"
   }
 }

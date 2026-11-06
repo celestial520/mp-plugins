@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+Thumbs.db
+*.tmp
+*.log
+.env
+
+# 令牌导出工具生成的凭据目录（等同账号钥匙，绝对不要提交）
+/data/

@@ -24,10 +24,10 @@
 
 ### 1. 在 MP 里添加一次仓库
 
-外部插件仓库地址：
+外部插件仓库地址（**不要带 `.git` 后缀**，带后缀会让 MP 拼 raw 地址时拉不到清单）：
 
 ```
-https://github.com/celestial520/mp-plugins.git
+https://github.com/celestial520/mp-plugins
 ```
 
 MP →【插件】→ 插件仓库／设置 → **添加外部插件仓库** → 粘贴上面的地址并保存 → 刷新插件列表。
@@ -105,8 +105,8 @@ mp-plugins/
 **Q：插件之间会冲突吗？**
 不会。它们监听不同事件、读写各自的插件数据；但两个 115 秒传类插件别监控同一个目录，否则会抢文件。
 
-**Q：外部插件仓库拉取失败 / 列表不刷新？**
-检查 NAS 能否访问 GitHub；不行就用「手动安装」把插件目录复制进 MP 的 `app/plugins/`。拉到新版本后在插件页点更新并重启 MP。
+**Q：外部插件仓库拉取失败 / 列表不刷新 / 版本号一直不涨？**
+按顺序排查：① 仓库地址必须是 `https://github.com/celestial520/mp-plugins`，**不要带 `.git`**；② 检查 NAS 能否访问 GitHub，走 `GITHUB_PROXY` 的话注意镜像会缓存 `package.v2.json`，可先在插件页刷新／重新同步，必要时换个镜像或重启 MP；③ 插件市场显示的是**清单版本**，已安装插件卡片显示的是**安装时记录的版本**——清单更新后必须在该插件上点「更新」才会替换 `app/plugins/` 里的 `__init__.py`；④ 更新完重启 MP 容器，设置页的新控件才会出现。实在拉不动就用「手动安装」把 `plugins.v2/workbuddycheckin` 复制进 MP 的 `app/plugins/` 再重启。
 
 **Q：企业微信通知能不能用？**
 能。以上插件都走 MP【设定 → 通知】里已配好的渠道（`CommandChain.post_message`），插件本身不需要填 corpid / Secret / AgentId。

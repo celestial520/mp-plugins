@@ -39,7 +39,7 @@ class WorkBuddyCheckin(_PluginBase):
     plugin_name = "WorkBuddy每日签到"
     plugin_desc = "每天自动领 WorkBuddy 每日礼包积分，令牌自续期，签到成功走 MP 内置渠道通知。"
     plugin_icon = ""
-    plugin_version = "1.0"
+    plugin_version = "1.0.2"
     plugin_author = "celestial520"
     auth_level = 1
 
@@ -53,8 +53,26 @@ class WorkBuddyCheckin(_PluginBase):
     # ================= 生命周期 =================
     def init_plugin(self, config: dict = None):
         self.config = config or {}
-        logger.info("%s 插件已加载 | 启用=%s | 每日 %s | 通知=%s",
-                    TAG, self.get_state(), self._check_at(), self._notify_enabled())
+        logger.info("%s 插件已加载 | 版本=%s | 启用=%s | 每日 %s | 通知=%s",
+                    TAG, self.plugin_version, self.get_state(), self._check_at(),
+                    self._notify_enabled())
+        # 「保存设置后立即签到一次」开关：保存配置会触发 init_plugin，这里异步跑一次并自动复位
+        if self.config.get("run_now"):
+            threading.Thread(target=self._run_now_once, daemon=True,
+                             name="WorkBuddyCheckinRunNow").start()
+
+    def _run_now_once(self):
+        """手动立即执行一次，然后把开关写回 False，避免 MP 每次重启都重跑。"""
+        try:
+            self.checkin_task(force=True)
+        finally:
+            try:
+                new_cfg = dict(self.config)
+                new_cfg["run_now"] = False
+                self.config["run_now"] = False
+                self.update_config(new_cfg)
+            except Exception as e:
+                logger.warning("%s 复位「立即执行」开关失败：%s", TAG, e)
 
     def get_state(self) -> bool:
         return bool(self.config.get("enabled"))
@@ -143,6 +161,17 @@ class WorkBuddyCheckin(_PluginBase):
                             ]},
                         ]
                     },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {"component": "VCol", "props": {"cols": 12}, "content": [
+                                {"component": "VSwitch",
+                                 "props": {"model": "run_now",
+                                           "color": "primary",
+                                           "label": "立即执行：打开后点保存，马上签到一次（跑完自动关闭）"}}
+                            ]},
+                        ]
+                    },
                 ]
             }
         ], {
@@ -154,6 +183,7 @@ class WorkBuddyCheckin(_PluginBase):
             "domain": "www.workbuddy.cn",
             "check_at": "09:00",
             "retry_minutes": "30",
+            "run_now": False,
         }
 
     # ================= 定时任务 =================
@@ -222,9 +252,8 @@ class WorkBuddyCheckin(_PluginBase):
         return {"success": True, "data": self._status_dict()}
 
     def api_check(self, force: bool = True, **kwargs):
-        if not self.get_state():
-            return {"success": False, "message": "插件未启用"}
-        self.checkin_task(force=bool(force))
+        # 手动触发不要求插件处于启用状态，方便先验证令牌与通知链路
+        self.checkin_task(force=True)
         return {"success": True, "data": self._last_result}
 
     def api_test_notify(self, **kwargs):
